@@ -9,6 +9,11 @@ import { ScrollArea } from '../ui/scroll-area';
 import { Button } from '../ui/button';
 import { Send, Bot, User, Loader2, Sparkles, AlertCircle, Leaf, BarChart3, Lightbulb } from 'lucide-react';
 
+/** API endpoint for chat - use Express server in dev, Vercel in production */
+const CHAT_API_ENDPOINT = import.meta.env.DEV
+  ? 'http://localhost:3001/api/chat'
+  : '/api/chat';
+
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -105,7 +110,7 @@ export function ChatPanel() {
     setError(null);
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetch(CHAT_API_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
