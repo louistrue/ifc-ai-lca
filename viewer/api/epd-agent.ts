@@ -30,7 +30,22 @@ interface MaterialSummary {
   totalArea: number;
   totalWeight: number | null;
   elementCount: number;
-  elementTypes: Record<string, number>;
+  // Element type breakdown with quantities (critical for EPD selection)
+  // e.g., { "IfcSlab": { count: 5, volume: 120.5 }, "IfcWall": { count: 3, volume: 45.2 } }
+  elementTypes: Record<string, { count: number; volume: number }>;
+  // Spatial grouping for material granularity
+  spatialBreakdown?: {
+    belowGround: { count: number; volume: number };
+    aboveGround: { count: number; volume: number };
+    byStorey: Record<string, { count: number; volume: number }>;
+  };
+  // Usage context hints for EPD selection
+  usageContext?: {
+    isStructural: boolean;
+    isExterior: boolean;
+    isFoundation: boolean;
+    primaryUse: string;
+  };
   commonProperties?: {
     thicknesses?: number[];
     fireRatings?: string[];
@@ -320,6 +335,28 @@ const toolDefinitions = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'suggest_material_split',
+      description: 'Analyze a material\'s spatial distribution and suggest splitting it into sub-materials for more accurate EPD matching. For example, concrete below ground vs above ground may need different EPDs due to different exposure conditions and requirements.',
+      parameters: {
+        type: 'object',
+        properties: {
+          material_id: {
+            type: 'string',
+            description: 'The material ID to analyze for potential splitting.',
+          },
+          split_criteria: {
+            type: 'string',
+            enum: ['elevation', 'storey', 'element_type', 'usage'],
+            description: 'How to split the material: elevation (below/above ground), storey (by floor level), element_type (by IFC type), or usage (structural/facade/interior).',
+          },
+        },
+        required: ['material_id', 'split_criteria'],
+      },
+    },
+  },
 ];
 
 // ============ Mock EPD Database ============
@@ -389,10 +426,34 @@ function handleGetModelOverview(context: ModelSummary): string {
     if (mat.totalArea > 0) output += ` | Area: ${mat.totalArea.toFixed(2)} m²`;
     output += '\n';
 
-    // Element type breakdown
+    // Element type breakdown with volumes
     const types = Object.entries(mat.elementTypes);
     if (types.length > 0) {
-      output += `     Used in: ${types.map(([t, c]) => `${t} (${c})`).join(', ')}\n`;
+      output += `     Used in: ${types.map(([t, data]) => `${t} (${data.count}, ${data.volume.toFixed(1)}m³)`).join(', ')}\n`;
+    }
+
+    // Usage context
+    if (mat.usageContext) {
+      const ctx = mat.usageContext;
+      const tags: string[] = [];
+      if (ctx.isStructural) tags.push('STRUCTURAL');
+      if (ctx.isExterior) tags.push('EXTERIOR');
+      if (ctx.isFoundation) tags.push('FOUNDATION');
+      if (tags.length > 0 || ctx.primaryUse !== 'general') {
+        output += `     Usage: ${ctx.primaryUse}${tags.length > 0 ? ` [${tags.join(', ')}]` : ''}\n`;
+      }
+    }
+
+    // Spatial breakdown (key for material splitting decisions)
+    if (mat.spatialBreakdown) {
+      const { belowGround, aboveGround } = mat.spatialBreakdown;
+      if (belowGround.count > 0 && aboveGround.count > 0) {
+        output += `     ⚡ SPLIT OPPORTUNITY: Below ground (${belowGround.count} el, ${belowGround.volume.toFixed(1)}m³) vs Above ground (${aboveGround.count} el, ${aboveGround.volume.toFixed(1)}m³)\n`;
+      } else if (belowGround.count > 0) {
+        output += `     Location: Below ground (${belowGround.count} el, ${belowGround.volume.toFixed(1)}m³)\n`;
+      } else if (aboveGround.count > 0) {
+        output += `     Location: Above ground (${aboveGround.count} el, ${aboveGround.volume.toFixed(1)}m³)\n`;
+      }
     }
 
     if (mat.currentEpd) {
@@ -432,8 +493,44 @@ function handleGetMaterialDetails(
   if (mat.totalWeight) output += `   Total Weight: ${mat.totalWeight.toFixed(1)} kg\n`;
 
   output += `\n🧱 ELEMENT TYPES:\n`;
-  for (const [type, count] of Object.entries(mat.elementTypes)) {
-    output += `   • ${type}: ${count} elements\n`;
+  for (const [type, data] of Object.entries(mat.elementTypes)) {
+    output += `   • ${type}: ${data.count} elements (${data.volume.toFixed(2)} m³)\n`;
+  }
+
+  // Usage context
+  if (mat.usageContext) {
+    output += `\n🎯 USAGE CONTEXT:\n`;
+    output += `   Primary Use: ${mat.usageContext.primaryUse}\n`;
+    output += `   Structural: ${mat.usageContext.isStructural ? 'Yes' : 'No'}\n`;
+    output += `   Exterior/Facade: ${mat.usageContext.isExterior ? 'Yes' : 'No'}\n`;
+    output += `   Foundation: ${mat.usageContext.isFoundation ? 'Yes' : 'No'}\n`;
+  }
+
+  // Spatial breakdown (critical for EPD granularity)
+  if (mat.spatialBreakdown) {
+    output += `\n📍 SPATIAL BREAKDOWN:\n`;
+    const { belowGround, aboveGround, byStorey } = mat.spatialBreakdown;
+
+    output += `   Below Ground: ${belowGround.count} elements (${belowGround.volume.toFixed(2)} m³)\n`;
+    output += `   Above Ground: ${aboveGround.count} elements (${aboveGround.volume.toFixed(2)} m³)\n`;
+
+    if (Object.keys(byStorey).length > 0) {
+      output += `   By Storey:\n`;
+      for (const [storeyName, data] of Object.entries(byStorey).sort((a, b) => b[1].volume - a[1].volume)) {
+        output += `     • ${storeyName}: ${data.count} elements (${data.volume.toFixed(2)} m³)\n`;
+      }
+    }
+
+    // Highlight split opportunities
+    if (belowGround.count > 0 && aboveGround.count > 0) {
+      const belowPct = ((belowGround.volume / mat.totalVolume) * 100).toFixed(0);
+      const abovePct = ((aboveGround.volume / mat.totalVolume) * 100).toFixed(0);
+      output += `\n   ⚡ SPLIT RECOMMENDATION:\n`;
+      output += `   This material spans both below and above ground.\n`;
+      output += `   Below ground: ${belowPct}% of volume - may need waterproofing/durability EPD\n`;
+      output += `   Above ground: ${abovePct}% of volume - standard EPD may be appropriate\n`;
+      output += `   Use suggest_material_split tool to analyze splitting options.\n`;
+    }
   }
 
   if (mat.commonProperties) {
@@ -771,6 +868,234 @@ function handleProposal(
   };
 }
 
+interface MaterialSplitSuggestion {
+  originalMaterialId: string;
+  originalMaterialName: string;
+  splitCriteria: string;
+  suggestedSplits: Array<{
+    name: string;
+    description: string;
+    elementCount: number;
+    volume: number;
+    volumePercent: number;
+    recommendedEpdCriteria: string;
+  }>;
+  rationale: string;
+}
+
+function handleSuggestMaterialSplit(
+  args: { material_id: string; split_criteria: 'elevation' | 'storey' | 'element_type' | 'usage' },
+  context: ModelSummary
+): { result: string; splitSuggestion?: MaterialSplitSuggestion } {
+  const mat = context.materials.find(m => m.id === args.material_id);
+  if (!mat) return { result: `Material "${args.material_id}" not found. Available materials: ${context.materials.map(m => m.id).join(', ')}` };
+
+  const suggestedSplits: MaterialSplitSuggestion['suggestedSplits'] = [];
+  let rationale = '';
+
+  switch (args.split_criteria) {
+    case 'elevation': {
+      if (!mat.spatialBreakdown) {
+        return { result: `No spatial data available for "${mat.name}". Cannot analyze elevation-based splitting.` };
+      }
+
+      const { belowGround, aboveGround } = mat.spatialBreakdown;
+
+      if (belowGround.count === 0 || aboveGround.count === 0) {
+        return { result: `Material "${mat.name}" is entirely ${belowGround.count > 0 ? 'below' : 'above'} ground. No split needed based on elevation.` };
+      }
+
+      const belowPct = (belowGround.volume / mat.totalVolume) * 100;
+      const abovePct = (aboveGround.volume / mat.totalVolume) * 100;
+
+      suggestedSplits.push({
+        name: `${mat.name} - Below Ground`,
+        description: 'Foundation, basement, and underground elements',
+        elementCount: belowGround.count,
+        volume: belowGround.volume,
+        volumePercent: belowPct,
+        recommendedEpdCriteria: 'Search for EPDs suitable for foundation/underground use - consider waterproofing requirements, sulfate resistance, higher durability class',
+      });
+
+      suggestedSplits.push({
+        name: `${mat.name} - Above Ground`,
+        description: 'Superstructure elements above grade',
+        elementCount: aboveGround.count,
+        volume: aboveGround.volume,
+        volumePercent: abovePct,
+        recommendedEpdCriteria: 'Standard EPD appropriate for building superstructure - consider fire rating, exposure class XC1-XC3',
+      });
+
+      rationale = `Splitting ${mat.name} by elevation is recommended because underground concrete often requires:
+- Higher durability (XA exposure classes for sulfate attack)
+- Waterproofing additives
+- Different strength requirements
+This results in different EPD characteristics. Below ground: ${belowPct.toFixed(1)}% of volume, Above ground: ${abovePct.toFixed(1)}% of volume.`;
+      break;
+    }
+
+    case 'storey': {
+      if (!mat.spatialBreakdown?.byStorey || Object.keys(mat.spatialBreakdown.byStorey).length === 0) {
+        return { result: `No storey data available for "${mat.name}". Cannot analyze storey-based splitting.` };
+      }
+
+      const storeyData = Object.entries(mat.spatialBreakdown.byStorey)
+        .sort((a, b) => b[1].volume - a[1].volume);
+
+      for (const [storeyName, data] of storeyData) {
+        const pct = (data.volume / mat.totalVolume) * 100;
+        suggestedSplits.push({
+          name: `${mat.name} - ${storeyName}`,
+          description: `Elements on ${storeyName}`,
+          elementCount: data.count,
+          volume: data.volume,
+          volumePercent: pct,
+          recommendedEpdCriteria: `Consider storey-specific requirements (fire rating varies by floor, structural loads decrease with height)`,
+        });
+      }
+
+      rationale = `Splitting ${mat.name} by storey allows for floor-specific EPD matching based on:
+- Varying fire rating requirements per floor
+- Different structural loads (higher at lower levels)
+- Potential for different concrete grades per floor`;
+      break;
+    }
+
+    case 'element_type': {
+      const typeData = Object.entries(mat.elementTypes)
+        .sort((a, b) => b[1].volume - a[1].volume);
+
+      if (typeData.length <= 1) {
+        return { result: `Material "${mat.name}" is only used in ${typeData[0]?.[0] || 'one element type'}. No split needed based on element type.` };
+      }
+
+      for (const [typeName, data] of typeData) {
+        const pct = (data.volume / mat.totalVolume) * 100;
+        let epdCriteria = 'Standard EPD for this element type';
+
+        // Element-type specific recommendations
+        if (typeName.includes('Slab')) {
+          epdCriteria = 'Floor slab concrete - consider flat slab or post-tensioned EPDs if applicable';
+        } else if (typeName.includes('Column')) {
+          epdCriteria = 'Column concrete - typically higher strength (C40+), may need specific high-strength EPDs';
+        } else if (typeName.includes('Wall')) {
+          epdCriteria = 'Wall concrete - consider if load-bearing vs partition, fire rating requirements';
+        } else if (typeName.includes('Beam')) {
+          epdCriteria = 'Beam concrete - structural grade, check reinforcement ratio for embodied carbon';
+        } else if (typeName.includes('Footing') || typeName.includes('Pile')) {
+          epdCriteria = 'Foundation concrete - high durability, sulfate resistant if applicable';
+        }
+
+        suggestedSplits.push({
+          name: `${mat.name} - ${typeName.replace('Ifc', '')}s`,
+          description: `All ${typeName.replace('Ifc', '')} elements`,
+          elementCount: data.count,
+          volume: data.volume,
+          volumePercent: pct,
+          recommendedEpdCriteria: epdCriteria,
+        });
+      }
+
+      rationale = `Splitting ${mat.name} by element type allows matching EPDs to specific structural requirements:
+- Columns often need higher strength concrete
+- Slabs may use different mixes (lightweight, post-tensioned)
+- Foundation elements need durability-focused EPDs`;
+      break;
+    }
+
+    case 'usage': {
+      if (!mat.usageContext) {
+        return { result: `No usage context available for "${mat.name}". Cannot analyze usage-based splitting.` };
+      }
+
+      const { isStructural, isExterior, isFoundation, primaryUse } = mat.usageContext;
+
+      // Group by usage patterns
+      if (isFoundation) {
+        suggestedSplits.push({
+          name: `${mat.name} - Foundation`,
+          description: 'Foundation and below-grade structural elements',
+          elementCount: Math.round(mat.elementCount * 0.2), // Estimate
+          volume: mat.totalVolume * 0.2,
+          volumePercent: 20,
+          recommendedEpdCriteria: 'Foundation-grade concrete with durability requirements (XA class)',
+        });
+      }
+
+      if (isStructural && !isFoundation) {
+        suggestedSplits.push({
+          name: `${mat.name} - Structural`,
+          description: 'Load-bearing superstructure elements',
+          elementCount: Math.round(mat.elementCount * 0.6),
+          volume: mat.totalVolume * 0.6,
+          volumePercent: 60,
+          recommendedEpdCriteria: 'Structural concrete meeting fire and strength requirements',
+        });
+      }
+
+      if (isExterior) {
+        suggestedSplits.push({
+          name: `${mat.name} - Exterior`,
+          description: 'Facade and exposed elements',
+          elementCount: Math.round(mat.elementCount * 0.2),
+          volume: mat.totalVolume * 0.2,
+          volumePercent: 20,
+          recommendedEpdCriteria: 'Exterior-grade with weather resistance (XF, XD exposure classes)',
+        });
+      }
+
+      if (suggestedSplits.length === 0) {
+        suggestedSplits.push({
+          name: mat.name,
+          description: `General use: ${primaryUse}`,
+          elementCount: mat.elementCount,
+          volume: mat.totalVolume,
+          volumePercent: 100,
+          recommendedEpdCriteria: 'Standard EPD appropriate for the primary use case',
+        });
+        rationale = `Material "${mat.name}" has a uniform usage context (${primaryUse}). No usage-based split recommended.`;
+      } else {
+        rationale = `Splitting ${mat.name} by usage context allows for performance-optimized EPD selection:
+- Foundation: durability-focused EPDs
+- Structural: strength and fire rating focused
+- Exterior: weather resistance focused`;
+      }
+      break;
+    }
+  }
+
+  const splitSuggestion: MaterialSplitSuggestion = {
+    originalMaterialId: mat.id,
+    originalMaterialName: mat.name,
+    splitCriteria: args.split_criteria,
+    suggestedSplits,
+    rationale,
+  };
+
+  // Build output
+  let output = `=== MATERIAL SPLIT ANALYSIS ===\n\n`;
+  output += `Material: ${mat.name}\n`;
+  output += `Split Criteria: ${args.split_criteria}\n`;
+  output += `Total Volume: ${mat.totalVolume.toFixed(2)} m³\n\n`;
+
+  output += `📊 SUGGESTED SPLITS:\n\n`;
+  for (const split of suggestedSplits) {
+    output += `${split.name}\n`;
+    output += `  Description: ${split.description}\n`;
+    output += `  Elements: ${split.elementCount} | Volume: ${split.volume.toFixed(2)} m³ (${split.volumePercent.toFixed(1)}%)\n`;
+    output += `  EPD Criteria: ${split.recommendedEpdCriteria}\n\n`;
+  }
+
+  output += `💡 RATIONALE:\n${rationale}\n\n`;
+
+  output += `⚡ NEXT STEPS:\n`;
+  output += `1. Use search_epd_database with criteria from each split\n`;
+  output += `2. Create separate propose_epd_mapping for each sub-material\n`;
+  output += `3. Note: Actual material splitting in the model requires user action\n`;
+
+  return { result: output, splitSuggestion };
+}
+
 function executeToolCall(
   toolName: string,
   args: Record<string, unknown>,
@@ -799,6 +1124,11 @@ function executeToolCall(
         args as { material_id: string; proposed_epd_id: string; confidence: number; reasoning: string; key_benefits?: string[] },
         context
       );
+    case 'suggest_material_split':
+      return handleSuggestMaterialSplit(
+        args as { material_id: string; split_criteria: 'elevation' | 'storey' | 'element_type' | 'usage' },
+        context
+      );
     default:
       return { result: `Unknown tool: ${toolName}` };
   }
@@ -810,34 +1140,48 @@ const systemPrompt = `You are an expert EPD (Environmental Product Declaration) 
 
 You have FULL ACCESS to the building model data through your tools:
 - Project information (element counts, spatial structure, total volumes)
-- All materials with quantities, element types, and properties
+- All materials with quantities, element types (with volumes), and properties
+- SPATIAL BREAKDOWN: Materials show above/below ground distribution and per-storey volumes
+- USAGE CONTEXT: Materials tagged as structural, exterior, foundation with primary use
 - Current EPD mappings with GWP values
-- Spatial breakdown by building storey
 - Individual element details when needed
 
 YOUR ROLE:
-1. Analyze the building model to understand materials and their usage
+1. Analyze the building model to understand materials and their usage context
 2. Identify opportunities for carbon reduction through better EPD choices
-3. Search the EPD database with appropriate technical criteria
-4. Propose EPD mappings with detailed, context-aware reasoning
+3. CRITICAL: Check for materials that span different contexts (e.g., concrete both below and above ground)
+4. Suggest material splits when a single EPD cannot accurately represent varied usage
+5. Propose EPD mappings with detailed, context-aware reasoning
+
+MATERIAL GRANULARITY - KEY CONCEPT:
+The same material (e.g., "Concrete C30/37") may need DIFFERENT EPDs based on:
+- ELEVATION: Below-ground concrete needs durability/waterproofing EPDs; above-ground is standard
+- ELEMENT TYPE: Column concrete (high-strength) vs slab concrete (standard) vs foundation (durable)
+- USAGE: Structural vs facade vs interior applications have different requirements
+
+Look for "⚡ SPLIT OPPORTUNITY" flags in model overview - these indicate materials that span multiple contexts.
 
 WORKFLOW FOR EPD OPTIMIZATION:
-1. Start with get_model_overview to understand the building
+1. Start with get_model_overview to understand the building and identify split opportunities
 2. Use get_high_impact_elements to prioritize materials by GWP contribution
-3. For each priority material, use get_material_details to understand usage context
-4. Search for better EPDs with search_epd_database using appropriate filters
+3. For each priority material:
+   a. Check spatialBreakdown and usageContext in the overview
+   b. If material spans multiple contexts (below+above ground, multiple element types), use suggest_material_split
+   c. Use get_material_details for full breakdown
+4. Search for appropriate EPDs with search_epd_database using context-specific filters
 5. Compare options with compare_epds
-6. Create proposals with propose_epd_mapping, explaining why the EPD fits
+6. Create proposals with propose_epd_mapping, specifying which portion of the material if split
 
 IMPORTANT GUIDELINES:
-- Always consider ELEMENT TYPES when selecting EPDs (e.g., structural concrete for slabs/columns)
-- Check if materials are used in walls, slabs, beams, etc. to select appropriate EPDs
+- ALWAYS check spatial breakdown before proposing an EPD - one EPD may not fit all uses
+- Use suggest_material_split(material_id, "elevation") for materials spanning above/below ground
+- Use suggest_material_split(material_id, "element_type") for materials used in diverse element types
 - Consider fire ratings and structural requirements mentioned in properties
 - Prioritize lower GWP options that still meet technical requirements
-- Explain your reasoning clearly, referencing specific element types and quantities
-- Create concrete proposals for the user to accept/reject
+- Explain your reasoning clearly, referencing specific element types, locations, and quantities
+- When a split is recommended, create separate proposals for each sub-material context
 
-Be thorough but efficient. Focus on actionable recommendations that reduce carbon.`;
+Be thorough but efficient. Focus on actionable recommendations that reduce carbon while maintaining technical accuracy.`;
 
 // ============ Main Handler ============
 

@@ -58,7 +58,7 @@ export interface ModelSummary {
   };
 }
 
-/** Material summary with element type breakdown */
+/** Material summary with smart grouping for EPD granularity */
 export interface MaterialSummary {
   id: string;
   name: string;
@@ -70,10 +70,29 @@ export interface MaterialSummary {
   totalWeight: number | null;
   elementCount: number;
 
-  // Element type breakdown (critical for EPD selection)
-  elementTypes: Record<string, number>;
+  // Element type breakdown with quantities (critical for EPD selection)
+  // e.g., { "IfcSlab": { count: 5, volume: 120.5 }, "IfcWall": { count: 3, volume: 45.2 } }
+  elementTypes: Record<string, { count: number; volume: number }>;
 
-  // Key properties aggregated
+  // Spatial grouping for material granularity
+  // Helps determine if same material needs different EPDs based on location
+  spatialBreakdown?: {
+    // By elevation zone (for concrete: below grade vs above grade)
+    belowGround: { count: number; volume: number };
+    aboveGround: { count: number; volume: number };
+    // By storey (for floor-specific analysis)
+    byStorey: Record<string, { count: number; volume: number }>;
+  };
+
+  // Usage context hints (derived from element types and properties)
+  usageContext?: {
+    isStructural: boolean;      // Used in load-bearing elements
+    isExterior: boolean;        // Used in facade/envelope
+    isFoundation: boolean;      // Used in foundations/footings
+    primaryUse: string;         // e.g., "floor slabs", "load-bearing walls", "facade"
+  };
+
+  // Key properties aggregated (for EPD matching criteria)
   commonProperties?: {
     thicknesses?: number[];
     fireRatings?: string[];
@@ -226,10 +245,47 @@ export function buildModelSummary(
     storeyCount = counts.storeys;
   }
 
-  // Build material summaries
+  // Build storey elevation lookup for spatial analysis
+  const storeyElevations = new Map<number, number>();
+  const storeyNames = new Map<number, string>();
+  if (spatialHierarchy) {
+    for (const [storeyId] of spatialHierarchy.byStorey) {
+      const elevation = spatialHierarchy.storeyElevations.get(storeyId) || 0;
+      storeyElevations.set(storeyId, elevation);
+
+      // Get storey name
+      for (const model of models) {
+        const name = model.ifcDataStore.entities?.getName?.(storeyId);
+        if (name) {
+          storeyNames.set(storeyId, name);
+          break;
+        }
+      }
+    }
+  }
+
+  // Structural element types for usage context detection
+  const STRUCTURAL_TYPES = new Set([
+    'IfcColumn', 'IfcBeam', 'IfcSlab', 'IfcWall', 'IfcWallStandardCase',
+    'IfcFooting', 'IfcPile', 'IfcMember', 'IfcPlate'
+  ]);
+  const FOUNDATION_TYPES = new Set(['IfcFooting', 'IfcPile', 'IfcFoundation']);
+  const EXTERIOR_TYPES = new Set([
+    'IfcCurtainWall', 'IfcWindow', 'IfcDoor', 'IfcRoof', 'IfcCovering'
+  ]);
+
+  // Build material summaries with spatial breakdown
   const materialSummaries: MaterialSummary[] = extractedMaterials.map(mat => {
-    // Calculate element type breakdown
-    const elementTypes: Record<string, number> = {};
+    // Element type breakdown with quantities
+    const elementTypes: Record<string, { count: number; volume: number }> = {};
+
+    // Spatial breakdown tracking
+    let belowGroundCount = 0, belowGroundVolume = 0;
+    let aboveGroundCount = 0, aboveGroundVolume = 0;
+    const byStorey: Record<string, { count: number; volume: number }> = {};
+
+    // Usage context tracking
+    let structuralCount = 0, exteriorCount = 0, foundationCount = 0;
 
     // Get current EPD match if exists
     let currentEpd: MaterialSummary['currentEpd'] | undefined;
@@ -249,8 +305,12 @@ export function buildModelSummary(
     // Sum up volume
     totalVolume += mat.totalVolume || 0;
 
+    // Average volume per element (for distribution)
+    const avgVolumePerElement = mat.elementIds.length > 0
+      ? (mat.totalVolume || 0) / mat.elementIds.length
+      : 0;
+
     // For element type breakdown, we need to look at each element
-    // This requires access to the model's entity table
     for (const model of models) {
       const entities = model.ifcDataStore.entities;
       if (!entities) continue;
@@ -263,10 +323,77 @@ export function buildModelSummary(
 
         const typeName = entities.getTypeName?.(originalId);
         if (typeName) {
-          elementTypes[typeName] = (elementTypes[typeName] || 0) + 1;
+          // Element type breakdown with volume
+          if (!elementTypes[typeName]) {
+            elementTypes[typeName] = { count: 0, volume: 0 };
+          }
+          elementTypes[typeName].count++;
+          elementTypes[typeName].volume += avgVolumePerElement;
+
+          // Usage context detection
+          if (STRUCTURAL_TYPES.has(typeName)) structuralCount++;
+          if (FOUNDATION_TYPES.has(typeName)) foundationCount++;
+          if (EXTERIOR_TYPES.has(typeName)) exteriorCount++;
+        }
+
+        // Spatial breakdown by storey elevation
+        if (spatialHierarchy) {
+          const storeyId = spatialHierarchy.elementToStorey.get(originalId);
+          if (storeyId !== undefined) {
+            const elevation = storeyElevations.get(storeyId) || 0;
+            const storeyName = storeyNames.get(storeyId) || `Level ${storeyId}`;
+
+            // Track by storey
+            if (!byStorey[storeyName]) {
+              byStorey[storeyName] = { count: 0, volume: 0 };
+            }
+            byStorey[storeyName].count++;
+            byStorey[storeyName].volume += avgVolumePerElement;
+
+            // Track above/below ground (assuming 0 = ground level)
+            if (elevation < 0) {
+              belowGroundCount++;
+              belowGroundVolume += avgVolumePerElement;
+            } else {
+              aboveGroundCount++;
+              aboveGroundVolume += avgVolumePerElement;
+            }
+          }
         }
       }
     }
+
+    // Determine primary use based on element types
+    const sortedTypes = Object.entries(elementTypes)
+      .sort((a, b) => b[1].volume - a[1].volume);
+    let primaryUse = 'general';
+    if (sortedTypes.length > 0) {
+      const topType = sortedTypes[0][0];
+      if (topType.includes('Slab')) primaryUse = 'floor slabs';
+      else if (topType.includes('Wall')) primaryUse = foundationCount > 0 ? 'foundation walls' : 'walls';
+      else if (topType.includes('Column')) primaryUse = 'columns';
+      else if (topType.includes('Beam')) primaryUse = 'beams';
+      else if (topType.includes('Footing') || topType.includes('Pile')) primaryUse = 'foundations';
+      else if (topType.includes('Roof')) primaryUse = 'roofing';
+      else if (topType.includes('Window') || topType.includes('Curtain')) primaryUse = 'facade/glazing';
+    }
+
+    // Build spatial breakdown if we have spatial data
+    const spatialBreakdown = (belowGroundCount > 0 || aboveGroundCount > 0 || Object.keys(byStorey).length > 0)
+      ? {
+          belowGround: { count: belowGroundCount, volume: Math.round(belowGroundVolume * 100) / 100 },
+          aboveGround: { count: aboveGroundCount, volume: Math.round(aboveGroundVolume * 100) / 100 },
+          byStorey,
+        }
+      : undefined;
+
+    // Build usage context
+    const usageContext = {
+      isStructural: structuralCount > mat.elementIds.length * 0.5,
+      isExterior: exteriorCount > mat.elementIds.length * 0.3,
+      isFoundation: foundationCount > 0,
+      primaryUse,
+    };
 
     return {
       id: mat.id,
@@ -277,6 +404,8 @@ export function buildModelSummary(
       totalWeight: mat.totalWeight || null,
       elementCount: mat.elementIds.length,
       elementTypes,
+      spatialBreakdown,
+      usageContext,
       currentEpd,
     };
   });
