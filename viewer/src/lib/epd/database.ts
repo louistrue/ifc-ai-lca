@@ -1,11 +1,204 @@
 /**
- * Sample EPD Database for Demo
- * Based on real-world EPD values from various sources
+ * EPD Database with Ökobaudat Integration
+ *
+ * This module provides EPD data from two sources:
+ * 1. Ökobaudat API (German Federal EPD Database) - Real data
+ * 2. Fallback mock data - Used when API is unavailable
+ *
+ * @see https://www.oekobaudat.de/
  */
 
-import type { EPD } from './types';
+import type { EPD, MaterialCategory } from './types';
+import { fetchFromOekobaudat, searchOekobaudatEPDs } from './oekobaudat-client';
 
-export const epdDatabase: EPD[] = [
+// ============ API State ============
+
+/** Whether Ökobaudat API is available */
+let oekobaudatAvailable: boolean | null = null;
+
+/** Cached EPDs from Ökobaudat */
+let cachedOekobaudatEPDs: EPD[] = [];
+
+/** Last time we checked API availability */
+let lastApiCheck = 0;
+
+const API_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+// ============ API Functions ============
+
+/**
+ * Check if Ökobaudat API is available
+ */
+export async function checkOekobaudatAvailability(): Promise<boolean> {
+  // Don't check too frequently
+  if (oekobaudatAvailable !== null && Date.now() - lastApiCheck < API_CHECK_INTERVAL) {
+    return oekobaudatAvailable;
+  }
+
+  try {
+    const epds = await fetchFromOekobaudat({ pageSize: 1 });
+    oekobaudatAvailable = epds.length > 0;
+    lastApiCheck = Date.now();
+    console.log(`[EPD Database] Ökobaudat API ${oekobaudatAvailable ? 'available' : 'unavailable'}`);
+    return oekobaudatAvailable;
+  } catch {
+    oekobaudatAvailable = false;
+    lastApiCheck = Date.now();
+    console.log('[EPD Database] Ökobaudat API unavailable, using fallback');
+    return false;
+  }
+}
+
+/**
+ * Load EPDs from Ökobaudat for common building material categories
+ */
+export async function loadOekobaudatEPDs(): Promise<EPD[]> {
+  if (cachedOekobaudatEPDs.length > 0) {
+    return cachedOekobaudatEPDs;
+  }
+
+  const isAvailable = await checkOekobaudatAvailability();
+  if (!isAvailable) {
+    return fallbackEPDDatabase;
+  }
+
+  try {
+    // Load EPDs for main construction material categories (German terms for better results)
+    const searchTerms = [
+      'Beton', // Concrete
+      'Stahl', // Steel
+      'Holz', // Wood
+      'Glas', // Glass
+      'Dämmstoff', // Insulation
+      'Aluminium', // Aluminum
+      'Gips', // Gypsum
+      'Ziegel', // Masonry/Brick
+    ];
+
+    const allEPDs: EPD[] = [];
+    const seenIds = new Set<string>();
+
+    for (const term of searchTerms) {
+      try {
+        const epds = await fetchFromOekobaudat({
+          search: term,
+          compliance: 'A2',
+          pageSize: 25,
+        });
+
+        for (const epd of epds) {
+          if (!seenIds.has(epd.id)) {
+            seenIds.add(epd.id);
+            allEPDs.push(epd);
+          }
+        }
+      } catch (err) {
+        console.warn(`[EPD Database] Failed to load EPDs for "${term}":`, err);
+      }
+    }
+
+    console.log(`[EPD Database] Loaded ${allEPDs.length} EPDs from Ökobaudat`);
+    cachedOekobaudatEPDs = allEPDs;
+    return allEPDs;
+  } catch (err) {
+    console.error('[EPD Database] Failed to load from Ökobaudat:', err);
+    return fallbackEPDDatabase;
+  }
+}
+
+/**
+ * Search EPDs - tries Ökobaudat first, falls back to local
+ */
+export async function searchEPDsOnline(query: string): Promise<EPD[]> {
+  const isAvailable = await checkOekobaudatAvailability();
+
+  if (isAvailable) {
+    try {
+      const results = await searchOekobaudatEPDs(query);
+      if (results.length > 0) {
+        return results;
+      }
+    } catch (err) {
+      console.warn('[EPD Database] Online search failed:', err);
+    }
+  }
+
+  // Fall back to local search
+  return searchEPDs(query);
+}
+
+/**
+ * Get all available EPDs (Ökobaudat + fallback)
+ */
+export async function getAllEPDs(): Promise<EPD[]> {
+  const oekobaudatEPDs = await loadOekobaudatEPDs();
+
+  if (oekobaudatEPDs.length > 0) {
+    // Merge with fallback, preferring Ökobaudat data
+    const merged = [...oekobaudatEPDs];
+    const oekobaudatCategories = new Set(oekobaudatEPDs.map(e => e.category));
+
+    // Add fallback EPDs for categories not covered by Ökobaudat
+    for (const epd of fallbackEPDDatabase) {
+      if (!oekobaudatCategories.has(epd.category)) {
+        merged.push(epd);
+      }
+    }
+
+    return merged;
+  }
+
+  return fallbackEPDDatabase;
+}
+
+/**
+ * Get the current EPD database (sync version for compatibility)
+ * Returns cached Ökobaudat data or fallback
+ */
+export function getEPDDatabase(): EPD[] {
+  if (cachedOekobaudatEPDs.length > 0) {
+    return cachedOekobaudatEPDs;
+  }
+  return fallbackEPDDatabase;
+}
+
+/**
+ * Get EPDs by category with Ökobaudat integration
+ */
+export async function getEPDsByCategoryOnline(category: MaterialCategory): Promise<EPD[]> {
+  const allEPDs = await getAllEPDs();
+  return allEPDs.filter(epd => epd.category === category);
+}
+
+// ============ Backward Compatibility ============
+
+/**
+ * Legacy: Direct access to EPD database (returns fallback + cached Ökobaudat)
+ * @deprecated Use getAllEPDs() for full Ökobaudat integration
+ */
+export const epdDatabase: EPD[] = new Proxy([] as EPD[], {
+  get(target, prop) {
+    // Return cached Ökobaudat data or fallback
+    const data = cachedOekobaudatEPDs.length > 0 ? cachedOekobaudatEPDs : fallbackEPDDatabase;
+
+    if (prop === 'length') return data.length;
+    if (typeof prop === 'string' && !isNaN(Number(prop))) {
+      return data[Number(prop)];
+    }
+    if (prop === Symbol.iterator) {
+      return data[Symbol.iterator].bind(data);
+    }
+    if (typeof prop === 'string' && typeof (data as unknown as Record<string, unknown>)[prop] === 'function') {
+      return (data as unknown as Record<string, (...args: unknown[]) => unknown>)[prop].bind(data);
+    }
+    return Reflect.get(data, prop);
+  },
+});
+
+// ============ Fallback EPD Database ============
+// Used when Ökobaudat API is unavailable
+
+const fallbackEPDDatabase: EPD[] = [
   // ============ CONCRETE ============
   {
     id: 'epd-concrete-001',
@@ -481,20 +674,93 @@ export const epdDatabase: EPD[] = [
   },
 ];
 
+// ============ Helper Functions ============
+
+/**
+ * Get EPD by ID (checks both cached Ökobaudat and fallback)
+ */
 export function getEPDById(id: string): EPD | undefined {
-  return epdDatabase.find(epd => epd.id === id);
+  // Check cached Ökobaudat first
+  if (cachedOekobaudatEPDs.length > 0) {
+    const found = cachedOekobaudatEPDs.find(epd => epd.id === id);
+    if (found) return found;
+  }
+  // Fall back to local database
+  return fallbackEPDDatabase.find(epd => epd.id === id);
 }
 
+/**
+ * Get EPD by ID - async version that checks online
+ */
+export async function getEPDByIdOnline(id: string): Promise<EPD | undefined> {
+  // First try local/cached
+  const local = getEPDById(id);
+  if (local) return local;
+
+  // If it's an Ökobaudat ID, try to fetch it
+  if (id.startsWith('oekobaudat-')) {
+    const uuid = id.replace('oekobaudat-', '');
+    try {
+      const apiEndpoint = typeof window !== 'undefined' && import.meta.env.DEV
+        ? `http://localhost:3001/api/oekobaudat/${uuid}`
+        : `/api/oekobaudat/${uuid}`;
+
+      const response = await fetch(apiEndpoint);
+      if (response.ok) {
+        // Would need to transform the single process response
+        // For now, just search in the loaded data
+        await loadOekobaudatEPDs();
+        return cachedOekobaudatEPDs.find(epd => epd.id === id);
+      }
+    } catch {
+      // Fall through to undefined
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Get EPDs by category (sync - uses cached data)
+ */
 export function getEPDsByCategory(category: string): EPD[] {
-  return epdDatabase.filter(epd => epd.category === category);
+  const data = cachedOekobaudatEPDs.length > 0 ? cachedOekobaudatEPDs : fallbackEPDDatabase;
+  return data.filter(epd => epd.category === category);
 }
 
+/**
+ * Search EPDs locally (sync - uses cached data)
+ */
 export function searchEPDs(query: string): EPD[] {
   const lowerQuery = query.toLowerCase();
-  return epdDatabase.filter(epd =>
+  const data = cachedOekobaudatEPDs.length > 0 ? cachedOekobaudatEPDs : fallbackEPDDatabase;
+
+  return data.filter(epd =>
     epd.name.toLowerCase().includes(lowerQuery) ||
     epd.keywords.some(k => k.toLowerCase().includes(lowerQuery)) ||
     epd.category.toLowerCase().includes(lowerQuery) ||
     (epd.subcategory?.toLowerCase().includes(lowerQuery))
   );
+}
+
+/**
+ * Get EPD data source info
+ */
+export function getEPDDataSourceInfo(): {
+  source: 'oekobaudat' | 'fallback';
+  count: number;
+  lastUpdated: number | null;
+} {
+  if (cachedOekobaudatEPDs.length > 0) {
+    return {
+      source: 'oekobaudat',
+      count: cachedOekobaudatEPDs.length,
+      lastUpdated: lastApiCheck,
+    };
+  }
+  return {
+    source: 'fallback',
+    count: fallbackEPDDatabase.length,
+    lastUpdated: null,
+  };
 }

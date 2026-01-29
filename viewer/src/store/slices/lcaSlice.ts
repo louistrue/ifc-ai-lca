@@ -1,11 +1,37 @@
 /**
  * LCA (Life Cycle Assessment) State Slice
  * Manages EPD matching results and LCA calculations
+ * With Ökobaudat integration for real EPD data
  */
 
 import type { StateCreator } from 'zustand';
 import type { ExtractedMaterial, EPDMatch, LCAResults, MaterialCategory } from '../../lib/epd/types';
 import { matchAllMaterials, detectCategory, findBestMatch } from '../../lib/epd/matcher';
+import { matchAllMaterialsWithLLM, checkLLMAvailability } from '../../lib/epd/llm-matcher';
+import {
+  loadOekobaudatEPDs,
+  checkOekobaudatAvailability,
+  getEPDDataSourceInfo,
+} from '../../lib/epd/database';
+
+// EPD Proposal from agent
+export interface EPDProposal {
+  id: string;
+  material_id: string;
+  material_name: string;
+  current_epd_id?: string;
+  current_epd_name?: string;
+  current_gwp?: number;
+  proposed_epd_id: string;
+  proposed_epd_name: string;
+  proposed_gwp: number;
+  gwp_difference: number;
+  gwp_difference_percent: number;
+  confidence: number;
+  reasoning: string;
+  key_benefits: string[];
+  status: 'pending' | 'accepted' | 'rejected';
+}
 
 export interface LCASlice {
   // Extracted materials from IFC
@@ -17,16 +43,39 @@ export interface LCASlice {
   // UI State
   selectedMaterialId: string | null;
   highlightedMaterialElements: number[];
+  isMatchingInProgress: boolean;
+  matchingMethod: 'none' | 'algorithmic' | 'llm';
+  llmAvailable: boolean;
+
+  // Ökobaudat State
+  epdDataSource: 'oekobaudat' | 'fallback' | 'loading';
+  epdCount: number;
+  isLoadingEPDs: boolean;
+
+  // EPD Agent Proposals
+  epdProposals: EPDProposal[];
+  isAgentProcessing: boolean;
 
   // Actions
   setExtractedMaterials: (materials: ExtractedMaterial[]) => void;
   runEPDMatching: () => void;
+  runLLMEPDMatching: () => Promise<void>;
   selectMaterial: (materialId: string | null) => void;
   clearLCAResults: () => void;
+  checkLLMStatus: () => Promise<void>;
+  loadEPDsFromOekobaudat: () => Promise<void>;
+
+  // EPD Proposal Actions
+  addEPDProposals: (proposals: EPDProposal[]) => void;
+  acceptProposal: (proposalId: string) => void;
+  rejectProposal: (proposalId: string) => void;
+  clearProposals: () => void;
+  setAgentProcessing: (processing: boolean) => void;
 
   // Helpers
   getMaterialById: (id: string) => ExtractedMaterial | undefined;
   getMatchByMaterialId: (id: string) => EPDMatch | undefined;
+  getPendingProposals: () => EPDProposal[];
 }
 
 export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, get) => ({
@@ -35,10 +84,51 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
   lcaResults: null,
   selectedMaterialId: null,
   highlightedMaterialElements: [],
+  isMatchingInProgress: false,
+  matchingMethod: 'none',
+  llmAvailable: false,
+
+  // Ökobaudat state
+  epdDataSource: 'loading',
+  epdCount: 0,
+  isLoadingEPDs: false,
+
+  // EPD Agent state
+  epdProposals: [],
+  isAgentProcessing: false,
 
   // Actions
   setExtractedMaterials: (materials) => {
     set({ extractedMaterials: materials });
+  },
+
+  loadEPDsFromOekobaudat: async () => {
+    const { isLoadingEPDs } = get();
+    if (isLoadingEPDs) return;
+
+    set({ isLoadingEPDs: true, epdDataSource: 'loading' });
+
+    try {
+      console.log('[LCA] Loading EPDs from Ökobaudat...');
+      const epds = await loadOekobaudatEPDs();
+      const info = getEPDDataSourceInfo();
+
+      console.log(`[LCA] EPD data loaded: ${info.count} EPDs from ${info.source}`);
+
+      set({
+        isLoadingEPDs: false,
+        epdDataSource: info.source,
+        epdCount: info.count,
+      });
+    } catch (error) {
+      console.error('[LCA] Failed to load EPDs:', error);
+      const info = getEPDDataSourceInfo();
+      set({
+        isLoadingEPDs: false,
+        epdDataSource: info.source,
+        epdCount: info.count,
+      });
+    }
   },
 
   runEPDMatching: () => {
@@ -47,8 +137,35 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
       return;
     }
 
+    set({ isMatchingInProgress: true });
     const results = matchAllMaterials(extractedMaterials);
-    set({ lcaResults: results });
+    set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: 'algorithmic' });
+  },
+
+  runLLMEPDMatching: async () => {
+    const { extractedMaterials } = get();
+    if (extractedMaterials.length === 0) {
+      return;
+    }
+
+    set({ isMatchingInProgress: true, matchingMethod: 'none' });
+
+    try {
+      console.log('[LCA] Running LLM-based EPD matching...');
+      const results = await matchAllMaterialsWithLLM(extractedMaterials, true);
+
+      // Determine which method was actually used
+      const usedLLM = results.matches.some(m => m.matchReason.startsWith('LLM:'));
+      const method = usedLLM ? 'llm' : 'algorithmic';
+
+      console.log(`[LCA] Matching complete using ${method} method`);
+      set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: method });
+    } catch (error) {
+      console.error('[LCA] LLM matching failed:', error);
+      // Fall back to algorithmic
+      const results = matchAllMaterials(extractedMaterials);
+      set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: 'algorithmic' });
+    }
   },
 
   selectMaterial: (materialId) => {
@@ -67,7 +184,88 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
       lcaResults: null,
       selectedMaterialId: null,
       highlightedMaterialElements: [],
+      matchingMethod: 'none',
     });
+  },
+
+  checkLLMStatus: async () => {
+    const available = await checkLLMAvailability();
+    set({ llmAvailable: available });
+    console.log(`[LCA] LLM availability: ${available}`);
+  },
+
+  // EPD Proposal Actions
+  addEPDProposals: (proposals) => {
+    set((state) => ({
+      epdProposals: [...state.epdProposals, ...proposals],
+    }));
+  },
+
+  acceptProposal: (proposalId) => {
+    const { epdProposals, lcaResults } = get();
+    const proposal = epdProposals.find(p => p.id === proposalId);
+
+    if (!proposal || !lcaResults) return;
+
+    // Update the proposal status
+    const updatedProposals = epdProposals.map(p =>
+      p.id === proposalId ? { ...p, status: 'accepted' as const } : p
+    );
+
+    // Update LCA results with the new EPD
+    // For demo, we update the calculated GWP based on the proposal
+    const updatedMatches = lcaResults.matches.map(match => {
+      if (match.material.id === proposal.material_id) {
+        return {
+          ...match,
+          epd: {
+            ...match.epd,
+            id: proposal.proposed_epd_id,
+            name: proposal.proposed_epd_name,
+          },
+          calculatedGWP: proposal.proposed_gwp,
+          confidence: proposal.confidence,
+          matchReason: `Agent: ${proposal.reasoning}`,
+        };
+      }
+      return match;
+    });
+
+    // Recalculate totals
+    const totalGWP = updatedMatches.reduce((sum, m) => sum + m.calculatedGWP, 0);
+    const byCategory = new Map<MaterialCategory, number>();
+    for (const match of updatedMatches) {
+      const cat = match.material.category;
+      byCategory.set(cat, (byCategory.get(cat) || 0) + match.calculatedGWP);
+    }
+
+    set({
+      epdProposals: updatedProposals,
+      lcaResults: {
+        ...lcaResults,
+        matches: updatedMatches,
+        totalGWP,
+        byCategory,
+      },
+    });
+
+    console.log(`[LCA] Accepted proposal ${proposalId}, new total GWP: ${totalGWP.toFixed(0)} kg CO₂e`);
+  },
+
+  rejectProposal: (proposalId) => {
+    set((state) => ({
+      epdProposals: state.epdProposals.map(p =>
+        p.id === proposalId ? { ...p, status: 'rejected' as const } : p
+      ),
+    }));
+  },
+
+  clearProposals: () => {
+    set({ epdProposals: [] });
+  },
+
+  setAgentProcessing: (processing) => {
+    set({ isAgentProcessing: processing });
   },
 
   // Helpers
@@ -78,6 +276,10 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
   getMatchByMaterialId: (id) => {
     const { lcaResults } = get();
     return lcaResults?.matches.find(m => m.material.id === id);
+  },
+
+  getPendingProposals: () => {
+    return get().epdProposals.filter(p => p.status === 'pending');
   },
 });
 

@@ -9,7 +9,7 @@ import { extractMaterialsFromIFC } from '../../store/slices/lcaSlice';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs';
 import { ScrollArea } from '../ui/scroll-area';
 import { Badge } from '../ui/badge';
-import { Leaf, AlertTriangle, CheckCircle, ArrowRight, Loader2 } from 'lucide-react';
+import { Leaf, AlertTriangle, CheckCircle, ArrowRight, Loader2, Sparkles, Cpu, Database, Cloud } from 'lucide-react';
 import type { EPDMatch, ExtractedMaterial, MaterialCategory } from '../../lib/epd/types';
 
 const categoryColors: Record<MaterialCategory, string> = {
@@ -100,10 +100,22 @@ function MaterialCard({
 
       {match && isSelected && (
         <div className="mt-3 pt-3 border-t border-border/50">
-          <div className="text-xs text-muted-foreground mb-1">Matched EPD:</div>
+          <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+            <span>Matched EPD:</span>
+            {match.matchReason.startsWith('LLM:') && (
+              <Badge variant="secondary" className="text-[10px] px-1 py-0 h-4">
+                <Sparkles className="w-2.5 h-2.5 mr-0.5" />
+                AI
+              </Badge>
+            )}
+          </div>
           <div className="text-sm font-medium">{match.epd.name}</div>
           <div className="text-xs text-muted-foreground">{match.epd.manufacturer}</div>
-          <div className="text-xs text-muted-foreground mt-1">{match.matchReason}</div>
+          <div className="text-xs text-muted-foreground mt-1">
+            {match.matchReason.startsWith('LLM:')
+              ? match.matchReason.replace('LLM: ', '')
+              : match.matchReason}
+          </div>
 
           {match.alternatives && match.alternatives.length > 0 && (
             <div className="mt-2">
@@ -187,10 +199,23 @@ export function LCAPanel() {
   const extractedMaterials = useViewerStore((s) => s.extractedMaterials);
   const lcaResults = useViewerStore((s) => s.lcaResults);
   const selectedMaterialId = useViewerStore((s) => s.selectedMaterialId);
+  const isMatchingInProgress = useViewerStore((s) => s.isMatchingInProgress);
+  const matchingMethod = useViewerStore((s) => s.matchingMethod);
   const setExtractedMaterials = useViewerStore((s) => s.setExtractedMaterials);
   const runEPDMatching = useViewerStore((s) => s.runEPDMatching);
   const selectMaterial = useViewerStore((s) => s.selectMaterial);
   const setSelectedEntityIds = useViewerStore((s) => s.setSelectedEntityIds);
+
+  // Ökobaudat state
+  const epdDataSource = useViewerStore((s) => s.epdDataSource);
+  const epdCount = useViewerStore((s) => s.epdCount);
+  const isLoadingEPDs = useViewerStore((s) => s.isLoadingEPDs);
+  const loadEPDsFromOekobaudat = useViewerStore((s) => s.loadEPDsFromOekobaudat);
+
+  // Load EPDs from Ökobaudat on mount
+  useEffect(() => {
+    loadEPDsFromOekobaudat();
+  }, [loadEPDsFromOekobaudat]);
 
   // Extract materials when IFC data is loaded
   useEffect(() => {
@@ -200,12 +225,13 @@ export function LCAPanel() {
     }
   }, [ifcDataStore, geometryResult, setExtractedMaterials]);
 
-  // Run EPD matching when materials are extracted
+  // Run fuzzy/algorithmic EPD matching when materials are extracted (instant results)
+  // LLM refinement is available through the chat panel's EPD Agent mode
   useEffect(() => {
-    if (extractedMaterials.length > 0 && !lcaResults) {
+    if (extractedMaterials.length > 0 && !lcaResults && !isMatchingInProgress) {
       runEPDMatching();
     }
-  }, [extractedMaterials, lcaResults, runEPDMatching]);
+  }, [extractedMaterials, lcaResults, isMatchingInProgress, runEPDMatching]);
 
   // Highlight elements when material is selected
   const handleSelectMaterial = (materialId: string) => {
@@ -242,12 +268,64 @@ export function LCAPanel() {
     );
   }
 
+  if (isMatchingInProgress) {
+    return (
+      <div className="h-full flex items-center justify-center text-muted-foreground text-sm">
+        <div className="text-center">
+          <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2 text-primary" />
+          <p>Matching materials to EPDs...</p>
+          <p className="text-xs mt-1 opacity-70">Use Chat for AI-powered refinement</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <Tabs defaultValue="materials" className="h-full flex flex-col">
       <TabsList className="mx-2 mt-2 grid grid-cols-2">
         <TabsTrigger value="materials">Materials</TabsTrigger>
         <TabsTrigger value="summary">Summary</TabsTrigger>
       </TabsList>
+
+      {/* Data source and matching method indicator */}
+      <div className="mx-2 mt-2 flex flex-col items-center gap-1 text-xs text-muted-foreground">
+        {/* EPD Data Source */}
+        <div className="flex items-center gap-1.5">
+          {isLoadingEPDs ? (
+            <>
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span>Loading EPD database...</span>
+            </>
+          ) : epdDataSource === 'oekobaudat' ? (
+            <>
+              <Cloud className="w-3 h-3 text-green-500" />
+              <span className="text-green-600">Ökobaudat ({epdCount} EPDs)</span>
+            </>
+          ) : (
+            <>
+              <Database className="w-3 h-3 text-yellow-500" />
+              <span className="text-yellow-600">Fallback data ({epdCount} EPDs)</span>
+            </>
+          )}
+        </div>
+
+        {/* Matching method */}
+        {matchingMethod !== 'none' && (
+          <div className="flex items-center gap-1.5">
+            {matchingMethod === 'llm' ? (
+              <>
+                <Sparkles className="w-3 h-3 text-primary" />
+                <span>AI-matched (GPT-4o-mini)</span>
+              </>
+            ) : (
+              <>
+                <Cpu className="w-3 h-3" />
+                <span>Algorithmic matching</span>
+              </>
+            )}
+          </div>
+        )}
+      </div>
 
       <TabsContent value="materials" className="flex-1 min-h-0 m-0">
         <ScrollArea className="h-full">

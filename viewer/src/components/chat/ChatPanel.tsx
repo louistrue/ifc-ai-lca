@@ -1,45 +1,192 @@
 /**
- * AI Chat Panel Component
- * Chat interface for LCA analysis using Vercel AI SDK
+ * EPD Assistant Chat Panel
+ * AI-powered EPD mapping assistant with full model context
+ * Helps users find better EPD matches for their building materials
+ *
+ * Uses rich model context including:
+ * - Project info (element counts, spatial structure)
+ * - Materials with element type breakdowns and quantities
+ * - Current EPD mappings with GWP values
+ * - Element details for specific materials
  */
 
-import { useRef, useEffect, useState, FormEvent } from 'react';
+import React, { useRef, useEffect, useState, FormEvent, useCallback, useMemo } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { useViewerStore } from '../../store';
 import { ScrollArea } from '../ui/scroll-area';
 import { Button } from '../ui/button';
-import { Send, Bot, User, Loader2, Sparkles, AlertCircle, Leaf, BarChart3, Lightbulb } from 'lucide-react';
+import { Send, Bot, User, Loader2, AlertCircle, Copy, Check, Wand2, Leaf, Search, BarChart3 } from 'lucide-react';
+import { EPDProposalsList } from './EPDProposalCard';
+import type { EPDProposal } from '../../store/slices/lcaSlice';
+import { buildModelSummary, estimatePayloadSize, type ModelSummary } from '../../lib/model-context';
+
+/** EPD Agent API endpoint */
+const AGENT_API_ENDPOINT = import.meta.env.DEV
+  ? 'http://localhost:3001/api/epd-agent'
+  : '/api/epd-agent';
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  proposals?: EPDProposal[];
 }
 
 const suggestedPrompts = [
-  { icon: BarChart3, text: 'Which material has the highest impact?' },
-  { icon: Lightbulb, text: 'Suggest lower-carbon alternatives' },
-  { icon: Leaf, text: 'Explain the total GWP calculation' },
+  { icon: Search, text: 'Find better EPDs for my materials' },
+  { icon: Leaf, text: 'Suggest lower-carbon alternatives' },
+  { icon: BarChart3, text: 'Which materials have the highest impact?' },
 ];
 
-function MessageBubble({ message }: { message: ChatMessage }) {
-  const isUser = message.role === 'user';
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  }, [text]);
 
   return (
-    <div className={`flex gap-2 ${isUser ? 'flex-row-reverse' : ''}`}>
+    <button
+      onClick={handleCopy}
+      className="p-1 rounded hover:bg-background/50 transition-colors opacity-0 group-hover:opacity-100"
+      title="Copy message"
+    >
+      {copied ? (
+        <Check className="w-3.5 h-3.5 text-green-500" />
+      ) : (
+        <Copy className="w-3.5 h-3.5 text-muted-foreground" />
+      )}
+    </button>
+  );
+}
+
+interface MessageBubbleProps {
+  message: ChatMessage;
+  onAcceptProposal?: (id: string) => void;
+  onRejectProposal?: (id: string) => void;
+}
+
+function MessageBubble({ message, onAcceptProposal, onRejectProposal }: MessageBubbleProps) {
+  const isUser = message.role === 'user';
+  const hasProposals = message.proposals && message.proposals.length > 0;
+
+  return (
+    <div className={`flex gap-2 group ${isUser ? 'flex-row-reverse' : ''}`}>
       <div
         className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 ${
-          isUser ? 'bg-primary text-primary-foreground' : 'bg-muted'
+          isUser ? 'bg-primary text-primary-foreground' : hasProposals ? 'bg-gradient-to-br from-primary to-purple-500 text-white' : 'bg-muted'
         }`}
       >
-        {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+        {isUser ? <User className="w-4 h-4" /> : hasProposals ? <Wand2 className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
       </div>
       <div
-        className={`flex-1 rounded-lg px-3 py-2 text-sm ${
+        className={`flex-1 rounded-lg px-3 py-2 text-sm relative ${
           isUser ? 'bg-primary text-primary-foreground' : 'bg-muted'
         }`}
       >
-        <div className="whitespace-pre-wrap">{message.content}</div>
+        {/* Copy button */}
+        <div className={`absolute top-1 ${isUser ? 'left-1' : 'right-1'}`}>
+          <CopyButton text={message.content} />
+        </div>
+
+        {/* Message content with markdown */}
+        {isUser ? (
+          <div className="whitespace-pre-wrap pr-6">{message.content}</div>
+        ) : (
+          <div className="prose prose-sm dark:prose-invert max-w-none pr-6 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+            <ReactMarkdown
+              components={{
+                // Style headings
+                h1: ({ children }) => <h3 className="text-base font-bold mt-3 mb-2">{children}</h3>,
+                h2: ({ children }) => <h4 className="text-sm font-bold mt-3 mb-1.5">{children}</h4>,
+                h3: ({ children }) => <h5 className="text-sm font-semibold mt-2 mb-1">{children}</h5>,
+                // Style paragraphs
+                p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+                // Style lists
+                ul: ({ children }) => <ul className="list-disc list-inside mb-2 space-y-1">{children}</ul>,
+                ol: ({ children }) => <ol className="list-decimal list-inside mb-2 space-y-1">{children}</ol>,
+                li: ({ children }) => <li className="text-sm">{children}</li>,
+                // Style bold/italic
+                strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
+                em: ({ children }) => <em className="italic">{children}</em>,
+                // Style code
+                code: ({ children, className }) => {
+                  const isBlock = className?.includes('language-');
+                  if (isBlock) {
+                    return (
+                      <code className="block bg-background/50 rounded p-2 text-xs overflow-x-auto my-2">
+                        {children}
+                      </code>
+                    );
+                  }
+                  return (
+                    <code className="bg-background/50 rounded px-1 py-0.5 text-xs font-mono">
+                      {children}
+                    </code>
+                  );
+                },
+                // Style blockquotes
+                blockquote: ({ children }) => (
+                  <blockquote className="border-l-2 border-primary/50 pl-3 italic my-2">
+                    {children}
+                  </blockquote>
+                ),
+                // Style tables
+                table: ({ children }) => (
+                  <div className="overflow-x-auto my-2">
+                    <table className="min-w-full text-xs border-collapse">{children}</table>
+                  </div>
+                ),
+                th: ({ children }) => (
+                  <th className="border border-border px-2 py-1 bg-muted/50 font-semibold text-left">
+                    {children}
+                  </th>
+                ),
+                td: ({ children }) => (
+                  <td className="border border-border px-2 py-1">{children}</td>
+                ),
+                // Style horizontal rules
+                hr: () => <hr className="my-3 border-border" />,
+              }}
+            >
+              {message.content}
+            </ReactMarkdown>
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Separate component to render proposals after a message
+ * This keeps proposals visually connected but semantically separate
+ */
+function MessageProposals({
+  proposals,
+  onAccept,
+  onReject
+}: {
+  proposals: EPDProposal[];
+  onAccept: (id: string) => void;
+  onReject: (id: string) => void;
+}) {
+  if (!proposals || proposals.length === 0) return null;
+
+  return (
+    <div className="ml-9 mt-2">
+      <EPDProposalsList
+        proposals={proposals}
+        onAccept={onAccept}
+        onReject={onReject}
+      />
     </div>
   );
 }
@@ -47,37 +194,29 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  // Get LCA context from store
+  // Chat state from store
+  const chatMessages = useViewerStore((s) => s.chatMessages);
+  const isChatLoading = useViewerStore((s) => s.isChatLoading);
+  const chatError = useViewerStore((s) => s.chatError);
+  const addChatMessage = useViewerStore((s) => s.addChatMessage);
+  const setChatLoading = useViewerStore((s) => s.setChatLoading);
+  const setChatError = useViewerStore((s) => s.setChatError);
+
+  // EPD proposal state
+  const addEPDProposals = useViewerStore((s) => s.addEPDProposals);
+  const acceptProposal = useViewerStore((s) => s.acceptProposal);
+  const rejectProposal = useViewerStore((s) => s.rejectProposal);
+  const setAgentProcessing = useViewerStore((s) => s.setAgentProcessing);
+  const isAgentProcessing = useViewerStore((s) => s.isAgentProcessing);
+
+  // Model context
   const lcaResults = useViewerStore((s) => s.lcaResults);
+  const extractedMaterials = useViewerStore((s) => s.extractedMaterials);
+  const getAllVisibleModels = useViewerStore((s) => s.getAllVisibleModels);
 
-  // Build context for the AI
-  const lcaContext = lcaResults
-    ? {
-        totalGWP: lcaResults.totalGWP,
-        matchedCount: lcaResults.matches.length,
-        unmatchedCount: lcaResults.unmatchedMaterials.length,
-        materials: lcaResults.matches.map((m) => ({
-          name: m.material.name,
-          category: m.material.category,
-          gwp: m.calculatedGWP,
-          confidence: m.confidence,
-          epd: m.epd.name,
-          quantity: m.quantity,
-          unit: m.calculatedUnit,
-          elementCount: m.material.elementIds.length,
-          alternatives: m.alternatives?.map((a) => ({
-            name: a.name,
-            gwp: a.impacts.gwp,
-          })),
-        })),
-        byCategory: Object.fromEntries(lcaResults.byCategory),
-      }
-    : null;
+  // Local input state
+  const [input, setInput] = useState('');
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -87,85 +226,95 @@ export function ChatPanel() {
         scrollElement.scrollTop = scrollElement.scrollHeight;
       }
     }
-  }, [messages]);
+  }, [chatMessages]);
+
+  // Build rich model context with ALL materials and smart grouping data
+  // OPTIMIZED for large models:
+  // - Sends ALL materials with spatial breakdown (above/below ground, by storey)
+  // - NO element details pre-fetched (agent requests on-demand)
+  // - Grouping data enables LLM to suggest material splits for better EPD granularity
+  const modelContext = useMemo((): { summary: ModelSummary } | null => {
+    if (!lcaResults || extractedMaterials.length === 0) return null;
+
+    const models = getAllVisibleModels();
+    if (models.length === 0) return null;
+
+    // Build the model summary with full context including spatial breakdown
+    const summary = buildModelSummary(models, extractedMaterials, lcaResults);
+
+    // Log payload size for debugging
+    const payloadSize = estimatePayloadSize(summary);
+    console.log(`[EPD Agent] Model context: ${summary.materials.length} materials, ${summary.project.elementCount.toLocaleString()} elements`);
+    console.log(`[EPD Agent] Payload size: ${payloadSize.summaryKB}KB (no element details - on-demand via tools)`);
+
+    // Log materials with spatial data for debugging
+    const materialsWithSpatial = summary.materials.filter(m => m.spatialBreakdown);
+    if (materialsWithSpatial.length > 0) {
+      console.log(`[EPD Agent] ${materialsWithSpatial.length} materials have spatial breakdown data`);
+    }
+
+    return { summary };
+  }, [lcaResults, extractedMaterials, getAllVisibleModels]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    if (!input.trim() || isChatLoading || isAgentProcessing || !modelContext) return;
 
-    const userMessage: ChatMessage = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: input.trim(),
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
+    const userMessage = input.trim();
     setInput('');
-    setIsLoading(true);
-    setError(null);
+    setChatError(null);
+    setChatLoading(true);
+    setAgentProcessing(true);
+
+    // Add user message
+    addChatMessage({ role: 'user', content: userMessage });
 
     try {
-      const response = await fetch('/api/chat', {
+      // Send model context with all materials and spatial breakdown
+      // Element details are NOT pre-sent - agent requests on-demand via tools
+      const response = await fetch(AGENT_API_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: [...messages, userMessage].map((m) => ({
+          message: userMessage,
+          modelContext: modelContext.summary,
+          conversationHistory: chatMessages.slice(-6).map(m => ({
             role: m.role,
-            content: m.content,
-          })),
-          context: lcaContext,
+            content: m.content
+          }))
         }),
       });
 
       if (!response.ok) {
         const data = await response.json();
-        throw new Error(data.error || 'Failed to get response');
+        throw new Error(data.error || 'Request failed');
       }
 
-      // Read streaming response
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No response body');
+      const data = await response.json();
 
-      const decoder = new TextDecoder();
-      let assistantContent = '';
-      const assistantId = `assistant-${Date.now()}`;
-
-      // Add empty assistant message
-      setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', content: '' }]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value);
-        // Parse SSE data chunks
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('0:')) {
-            // Text chunk
-            try {
-              const text = JSON.parse(line.slice(2));
-              assistantContent += text;
-              setMessages((prev) =>
-                prev.map((m) => (m.id === assistantId ? { ...m, content: assistantContent } : m))
-              );
-            } catch {
-              // Ignore parse errors
-            }
-          }
-        }
+      // Add proposals to store if any
+      const proposals: EPDProposal[] = data.proposals || [];
+      if (proposals.length > 0) {
+        addEPDProposals(proposals);
       }
+
+      // Add assistant response
+      addChatMessage({
+        role: 'assistant',
+        content: data.response || data.message || 'Analysis complete.',
+        proposals: proposals
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      setChatError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
-      setIsLoading(false);
+      setChatLoading(false);
+      setAgentProcessing(false);
     }
   };
 
   // Handle suggested prompt click
   const handleSuggestedPrompt = (prompt: string) => {
     setInput(prompt);
-    // Focus the input
     inputRef.current?.focus();
   };
 
@@ -180,27 +329,37 @@ export function ChatPanel() {
     }
   };
 
-  if (!lcaResults) {
+  if (!modelContext) {
     return (
       <div className="h-full flex flex-col items-center justify-center p-4 text-center text-muted-foreground">
-        <Sparkles className="w-8 h-8 mb-2 opacity-50" />
-        <p className="text-sm">Load an IFC file to start chatting about its environmental impact</p>
+        <Wand2 className="w-8 h-8 mb-2 opacity-50" />
+        <p className="text-sm">Load an IFC file to get EPD recommendations</p>
       </div>
     );
   }
 
   return (
     <div className="h-full flex flex-col">
+      {/* Header */}
+      <div className="px-3 py-2 border-b border-border flex items-center gap-2">
+        <Wand2 className="w-4 h-4 text-primary" />
+        <span className="text-xs font-medium">EPD Assistant</span>
+        <span className="text-xs text-muted-foreground">
+          • {modelContext.summary.materials.length} materials | {modelContext.summary.project.elementCount.toLocaleString()} elements
+        </span>
+      </div>
+
       {/* Messages */}
       <ScrollArea className="flex-1" ref={scrollRef}>
         <div className="p-3 space-y-3">
-          {messages.length === 0 && (
+          {chatMessages.length === 0 && (
             <div className="space-y-3">
               <div className="text-center py-4">
-                <Sparkles className="w-6 h-6 mx-auto mb-2 text-primary" />
-                <p className="text-sm font-medium">AI LCA Assistant</p>
+                <Wand2 className="w-6 h-6 mx-auto mb-2 text-primary" />
+                <p className="text-sm font-medium">EPD Assistant</p>
                 <p className="text-xs text-muted-foreground">
-                  Ask questions about your building's environmental impact
+                  I have access to your model's materials, properties, and current EPD mappings.
+                  Ask me to find better matches or optimize your LCA results.
                 </p>
               </div>
 
@@ -210,9 +369,9 @@ export function ChatPanel() {
                   <button
                     key={i}
                     onClick={() => handleSuggestedPrompt(prompt.text)}
-                    className="w-full flex items-center gap-2 p-2 rounded-lg border border-border hover:bg-muted/50 transition-colors text-left text-sm"
+                    className="w-full flex items-center gap-2 p-2 rounded-lg border border-primary/30 hover:bg-primary/10 transition-colors text-left text-sm"
                   >
-                    <prompt.icon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <prompt.icon className="w-4 h-4 flex-shrink-0 text-primary" />
                     <span>{prompt.text}</span>
                   </button>
                 ))}
@@ -220,25 +379,44 @@ export function ChatPanel() {
             </div>
           )}
 
-          {messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
+          {chatMessages.map((message) => (
+            <div key={message.id}>
+              <MessageBubble
+                message={message}
+                onAcceptProposal={acceptProposal}
+                onRejectProposal={rejectProposal}
+              />
+              {message.proposals && message.proposals.length > 0 && (
+                <MessageProposals
+                  proposals={message.proposals}
+                  onAccept={acceptProposal}
+                  onReject={rejectProposal}
+                />
+              )}
+            </div>
           ))}
 
-          {isLoading && messages[messages.length - 1]?.role !== 'assistant' && (
+          {/* Loading indicator */}
+          {isAgentProcessing && chatMessages[chatMessages.length - 1]?.role !== 'assistant' && (
             <div className="flex gap-2">
-              <div className="w-7 h-7 rounded-full flex items-center justify-center bg-muted flex-shrink-0">
-                <Bot className="w-4 h-4" />
+              <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 bg-gradient-to-br from-primary to-purple-500 text-white">
+                <Wand2 className="w-4 h-4" />
               </div>
               <div className="bg-muted rounded-lg px-3 py-2">
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <div className="flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span className="text-xs text-muted-foreground">
+                    Analyzing materials & searching EPDs...
+                  </span>
+                </div>
               </div>
             </div>
           )}
 
-          {error && (
+          {chatError && (
             <div className="flex items-center gap-2 text-sm text-red-500 p-2 bg-red-500/10 rounded-lg">
               <AlertCircle className="w-4 h-4" />
-              <span>{error}</span>
+              <span>{chatError}</span>
             </div>
           )}
         </div>
@@ -252,18 +430,18 @@ export function ChatPanel() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Ask about environmental impact..."
-            className="flex-1 resize-none bg-muted rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary min-h-[40px] max-h-[120px]"
+            placeholder="Ask about EPDs, materials, or LCA optimization..."
+            className="flex-1 resize-none rounded-lg px-3 py-2 text-sm bg-primary/5 focus:outline-none focus:ring-1 focus:ring-primary border border-primary/20 min-h-[40px] max-h-[120px]"
             rows={1}
-            disabled={isLoading}
+            disabled={isAgentProcessing}
           />
           <Button
             type="submit"
             size="icon"
-            disabled={!input.trim() || isLoading}
-            className="flex-shrink-0"
+            disabled={!input.trim() || isAgentProcessing}
+            className="flex-shrink-0 bg-gradient-to-br from-primary to-purple-500 hover:from-primary/90 hover:to-purple-500/90"
           >
-            {isLoading ? (
+            {isAgentProcessing ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : (
               <Send className="w-4 h-4" />
