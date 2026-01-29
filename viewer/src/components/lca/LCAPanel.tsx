@@ -202,7 +202,7 @@ export function LCAPanel() {
   const isMatchingInProgress = useViewerStore((s) => s.isMatchingInProgress);
   const matchingMethod = useViewerStore((s) => s.matchingMethod);
   const setExtractedMaterials = useViewerStore((s) => s.setExtractedMaterials);
-  const runLLMEPDMatching = useViewerStore((s) => s.runLLMEPDMatching);
+  const runEPDMatching = useViewerStore((s) => s.runEPDMatching);
   const selectMaterial = useViewerStore((s) => s.selectMaterial);
   const setSelectedEntityIds = useViewerStore((s) => s.setSelectedEntityIds);
 
@@ -225,12 +225,13 @@ export function LCAPanel() {
     }
   }, [ifcDataStore, geometryResult, setExtractedMaterials]);
 
-  // Run LLM EPD matching when materials are extracted (uses LLM with fallback)
+  // Run fuzzy/algorithmic EPD matching when materials are extracted (instant results)
+  // LLM refinement is available through the chat panel's EPD Agent mode
   useEffect(() => {
     if (extractedMaterials.length > 0 && !lcaResults && !isMatchingInProgress) {
-      runLLMEPDMatching();
+      runEPDMatching();
     }
-  }, [extractedMaterials, lcaResults, isMatchingInProgress, runLLMEPDMatching]);
+  }, [extractedMaterials, lcaResults, isMatchingInProgress, runEPDMatching]);
 
   // Highlight elements when material is selected
   const handleSelectMaterial = (materialId: string) => {
@@ -271,9 +272,9 @@ export function LCAPanel() {
     return (
       <div className="h-full flex items-center justify-center text-muted-foreground text-sm">
         <div className="text-center">
-          <Sparkles className="w-6 h-6 animate-pulse mx-auto mb-2 text-primary" />
-          <p>AI-powered EPD matching...</p>
-          <p className="text-xs mt-1 opacity-70">Using GPT-4o-mini for intelligent material matching</p>
+          <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2 text-primary" />
+          <p>Matching materials to EPDs...</p>
+          <p className="text-xs mt-1 opacity-70">Use Chat for AI-powered refinement</p>
         </div>
       </div>
     );
