@@ -88,34 +88,71 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
 export function extractMaterialsFromIFC(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ifcDataStore: any | null,
-  geometryMeshes?: { expressId: number; ifcType?: string }[]
+  geometryMeshes?: { expressId: number; ifcType?: string; volume?: number }[]
 ): ExtractedMaterial[] {
   if (!ifcDataStore) return [];
 
+  console.log('[LCA] Extracting materials from IFC data store');
+  console.log('[LCA] Data store keys:', Object.keys(ifcDataStore));
+  console.log('[LCA] Has quantities:', !!ifcDataStore.quantities);
+  console.log('[LCA] Quantities type:', ifcDataStore.quantities?.constructor?.name);
+  console.log('[LCA] Has getForEntity:', typeof ifcDataStore.quantities?.getForEntity);
+  console.log('[LCA] Geometry meshes count:', geometryMeshes?.length);
+
   const materialMap = new Map<string, ExtractedMaterial>();
 
-  // Get all entities with geometry (from meshes)
-  const entityIds = geometryMeshes?.map(m => m.expressId) || [];
+  // Helper to safely get quantities for an entity
+  const getQuantitiesForEntity = (entityId: number): { volume: number; area: number; weight: number } => {
+    let volume = 0;
+    let area = 0;
+    let weight = 0;
+
+    try {
+      // Method 1: ifc-lite getForEntity method (server-converted data)
+      if (ifcDataStore.quantities && typeof ifcDataStore.quantities.getForEntity === 'function') {
+        const qsets = ifcDataStore.quantities.getForEntity(entityId);
+        if (Array.isArray(qsets) && qsets.length > 0) {
+          for (const qset of qsets) {
+            const quantities = qset.quantities || [];
+            for (const qty of quantities) {
+              const lowerName = (qty.name || qty.quantity_name || '').toLowerCase();
+              const value = qty.value ?? qty.quantity_value ?? 0;
+
+              if (lowerName.includes('volume') || lowerName.includes('netvolume')) {
+                volume += value;
+              }
+              if (lowerName.includes('area') || lowerName.includes('netarea') || lowerName.includes('sidearea')) {
+                area += value;
+              }
+              if (lowerName.includes('weight') || lowerName.includes('mass')) {
+                weight += value;
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Silently fail for individual entities
+    }
+
+    return { volume, area, weight };
+  };
 
   // Try to extract materials from properties
-  // Handle different possible data structures from ifc-lite
   if (ifcDataStore.properties && typeof ifcDataStore.properties[Symbol.iterator] === 'function') {
     try {
       for (const [entityId, propSets] of ifcDataStore.properties) {
         if (!propSets || typeof propSets[Symbol.iterator] !== 'function') continue;
 
-        // Look for material-related property sets
-        for (const [psetName, props] of propSets) {
+        for (const [, props] of propSets) {
           if (!props) continue;
 
-          // Handle both Map and Object formats
           const getProp = (key: string) => {
             if (props instanceof Map) return props.get(key);
             if (typeof props === 'object') return (props as Record<string, unknown>)[key];
             return undefined;
           };
 
-          // Check for material name in properties
           const materialName = getProp('Material') as string ||
                               getProp('MaterialName') as string ||
                               getProp('material') as string;
@@ -132,47 +169,10 @@ export function extractMaterialsFromIFC(
     }
   }
 
-  // Helper to safely get quantities for an entity
-  const getQuantitiesForEntity = (entityId: number): { volume: number; area: number; weight: number } => {
-    let volume = 0;
-    let area = 0;
-    let weight = 0;
-
-    try {
-      if (!ifcDataStore.quantities) return { volume, area, weight };
-
-      // ifc-lite uses getForEntity method
-      if (typeof ifcDataStore.quantities.getForEntity === 'function') {
-        const qsets = ifcDataStore.quantities.getForEntity(entityId);
-        if (Array.isArray(qsets)) {
-          for (const qset of qsets) {
-            if (!qset.quantities) continue;
-            for (const qty of qset.quantities) {
-              const lowerName = (qty.name || '').toLowerCase();
-              const value = qty.value || 0;
-
-              if (lowerName.includes('volume') || lowerName.includes('netvolume')) {
-                volume += value;
-              }
-              if (lowerName.includes('area') || lowerName.includes('netarea') || lowerName.includes('sidearea')) {
-                area += value;
-              }
-              if (lowerName.includes('weight') || lowerName.includes('mass')) {
-                weight += value;
-              }
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('[LCA] Failed to get quantities for entity:', entityId, err);
-    }
-
-    return { volume, area, weight };
-  };
-
   // If no materials found from properties, try to infer from IFC types
   if (materialMap.size === 0 && geometryMeshes) {
+    console.log('[LCA] No materials found from properties, inferring from IFC types');
+
     // Group by IFC type as fallback
     const typeGroups = new Map<string, number[]>();
 
@@ -183,6 +183,8 @@ export function extractMaterialsFromIFC(
       typeGroups.set(ifcType, existing);
     }
 
+    console.log('[LCA] Found IFC types:', Array.from(typeGroups.keys()));
+
     // Create pseudo-materials from types
     for (const [ifcType, ids] of typeGroups) {
       const materialName = inferMaterialFromType(ifcType);
@@ -191,11 +193,44 @@ export function extractMaterialsFromIFC(
       // Get quantities if available
       let totalVolume = 0;
       let totalArea = 0;
+      let quantitiesFound = false;
 
       for (const entityId of ids) {
         const q = getQuantitiesForEntity(entityId);
+        if (q.volume > 0 || q.area > 0) {
+          quantitiesFound = true;
+        }
         totalVolume += q.volume;
         totalArea += q.area;
+      }
+
+      // If no quantities found, estimate based on typical values per element
+      if (!quantitiesFound) {
+        const typicalVolumes: Record<string, number> = {
+          IFCWALL: 2.5,          // ~2.5 m³ per wall element (typical wall section)
+          IFCWALLSTANDARDCASE: 2.5,
+          IFCSLAB: 0.5,          // ~0.5 m³ per slab element
+          IFCCOLUMN: 0.8,        // ~0.8 m³ per column
+          IFCBEAM: 0.3,          // ~0.3 m³ per beam
+          IFCFOOTING: 1.5,       // ~1.5 m³ per footing
+          IFCPILE: 2.0,          // ~2.0 m³ per pile
+          IFCSTAIR: 1.0,         // ~1.0 m³ per stair
+          IFCROOF: 0.4,          // ~0.4 m³ per roof element
+          IFCWINDOW: 0.05,       // ~0.05 m³ per window (frame + glass)
+          IFCDOOR: 0.1,          // ~0.1 m³ per door
+          IFCCOVERING: 0.02,     // ~0.02 m³ per covering (thin)
+          IFCCURTAINWALL: 0.1,   // ~0.1 m³ per curtain wall panel
+          IFCRAILING: 0.05,      // ~0.05 m³ per railing
+          IFCMEMBER: 0.15,       // ~0.15 m³ per member
+          IFCPLATE: 0.02,        // ~0.02 m³ per plate
+        };
+
+        const normalizedType = ifcType.toUpperCase();
+        const volumePerElement = typicalVolumes[normalizedType] || 0.5;
+        totalVolume = ids.length * volumePerElement;
+        console.log(`[LCA] Estimated ${ifcType}: ${ids.length} elements × ${volumePerElement} m³ = ${totalVolume.toFixed(1)} m³`);
+      } else {
+        console.log(`[LCA] Found quantities for ${ifcType}: ${totalVolume.toFixed(2)} m³, ${totalArea.toFixed(2)} m²`);
       }
 
       const material: ExtractedMaterial = {
@@ -212,6 +247,7 @@ export function extractMaterialsFromIFC(
     }
   }
 
+  console.log('[LCA] Extracted materials:', materialMap.size);
   return Array.from(materialMap.values());
 }
 
