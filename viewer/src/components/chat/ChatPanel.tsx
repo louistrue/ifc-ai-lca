@@ -136,6 +136,7 @@ export function ChatPanel() {
 
       const decoder = new TextDecoder();
       let assistantContent = '';
+      let buffer = ''; // Buffer for incomplete lines
       const assistantId = `assistant-${Date.now()}`;
 
       // Add empty assistant message
@@ -145,12 +146,17 @@ export function ChatPanel() {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value);
-        // Parse SSE data chunks
-        const lines = chunk.split('\n');
+        // Append new data to buffer
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete lines from buffer
+        const lines = buffer.split('\n');
+        // Keep the last potentially incomplete line in buffer
+        buffer = lines.pop() || '';
+
         for (const line of lines) {
           if (line.startsWith('0:')) {
-            // Text chunk
+            // Text chunk - parse the JSON string after "0:"
             try {
               const text = JSON.parse(line.slice(2));
               assistantContent += text;
@@ -158,9 +164,22 @@ export function ChatPanel() {
                 prev.map((m) => (m.id === assistantId ? { ...m, content: assistantContent } : m))
               );
             } catch {
-              // Ignore parse errors
+              // Ignore parse errors for malformed chunks
             }
           }
+        }
+      }
+
+      // Process any remaining data in buffer
+      if (buffer.startsWith('0:')) {
+        try {
+          const text = JSON.parse(buffer.slice(2));
+          assistantContent += text;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, content: assistantContent } : m))
+          );
+        } catch {
+          // Ignore
         }
       }
     } catch (err) {
