@@ -1,0 +1,1351 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import { useMemo, useState, useCallback, useEffect } from 'react';
+import {
+  Copy,
+  Check,
+  Focus,
+  EyeOff,
+  Eye,
+  Building2,
+  Layers,
+  FileText,
+  Calculator,
+  Tag,
+  MousePointer2,
+  ArrowUpDown,
+  FileBox,
+  Clock,
+  HardDrive,
+  Hash,
+  Database,
+  Edit3,
+  Sparkles,
+  PenLine,
+} from 'lucide-react';
+import { PropertyEditor, NewPropertyDialog, UndoRedoButtons } from './PropertyEditor';
+import { Button } from '@/components/ui/button';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { Badge } from '@/components/ui/badge';
+import { useViewerStore } from '@/store';
+import { useIfc } from '@/hooks/useIfc';
+import { IfcQuery } from '@ifc-lite/query';
+import { MutablePropertyView } from '@ifc-lite/mutations';
+import { extractPropertiesOnDemand, type IfcDataStore } from '@ifc-lite/parser';
+import type { EntityRef, FederatedModel } from '@/store/types';
+
+interface PropertySet {
+  name: string;
+  properties: Array<{ name: string; value: unknown; isMutated?: boolean }>;
+  isNewPset?: boolean;
+}
+
+interface QuantitySet {
+  name: string;
+  quantities: Array<{ name: string; value: number; type: number }>;
+}
+
+/**
+ * Result of parsing a property value.
+ * Contains the display value and optional IFC type for tooltip.
+ */
+interface ParsedPropertyValue {
+  displayValue: string;
+  ifcType?: string;
+}
+
+/**
+ * Map of IFC boolean enumeration values to human-readable text
+ */
+const BOOLEAN_MAP: Record<string, string> = {
+  '.T.': 'True',
+  '.F.': 'False',
+  '.U.': 'Unknown',
+};
+
+/**
+ * Friendly names for common IFC types (shown in tooltips)
+ */
+const IFC_TYPE_DISPLAY_NAMES: Record<string, string> = {
+  'IFCBOOLEAN': 'Boolean',
+  'IFCLOGICAL': 'Logical',
+  'IFCIDENTIFIER': 'Identifier',
+  'IFCLABEL': 'Label',
+  'IFCTEXT': 'Text',
+  'IFCREAL': 'Real',
+  'IFCINTEGER': 'Integer',
+  'IFCPOSITIVELENGTHMEASURE': 'Length',
+  'IFCLENGTHMEASURE': 'Length',
+  'IFCAREAMEASURE': 'Area',
+  'IFCVOLUMEMEASURE': 'Volume',
+  'IFCMASSMEASURE': 'Mass',
+  'IFCTHERMALTRANSMITTANCEMEASURE': 'Thermal Transmittance',
+  'IFCPRESSUREMEASURE': 'Pressure',
+  'IFCFORCEMEASURE': 'Force',
+  'IFCPLANEANGLEMEASURE': 'Angle',
+  'IFCTIMEMEASURE': 'Time',
+  'IFCNORMALISEDRATIOMEASURE': 'Ratio',
+  'IFCRATIOMEASURE': 'Ratio',
+  'IFCPOSITIVERATIOMEASURE': 'Ratio',
+  'IFCCOUNTMEASURE': 'Count',
+  'IFCMONETARYMEASURE': 'Currency',
+};
+
+/**
+ * Decode IFC STEP encoded strings.
+ * Handles:
+ * - \X2\XXXX\X0\ - Unicode hex encoding (e.g., \X2\00E4\X0\ → ä)
+ * - \X\XX\ - ISO-8859-1 hex encoding
+ * - \S\X - Extended ASCII with escape
+ */
+function decodeIfcString(str: string): string {
+  if (!str || typeof str !== 'string') return str;
+
+  let result = str;
+
+  // Decode \X2\XXXX\X0\ patterns (Unicode 2-byte hex, can have multiple chars)
+  // Pattern: \X2\ followed by hex pairs, ended by \X0\
+  result = result.replace(/\\X2\\([0-9A-Fa-f]+)\\X0\\/g, (_, hex) => {
+    // hex can be multiple 4-char sequences (e.g., "00E400FC" for "äü")
+    let decoded = '';
+    for (let i = 0; i < hex.length; i += 4) {
+      const charCode = parseInt(hex.substring(i, i + 4), 16);
+      if (!isNaN(charCode)) {
+        decoded += String.fromCharCode(charCode);
+      }
+    }
+    return decoded;
+  });
+
+  // Decode \X4\XXXXXXXX\X0\ patterns (Unicode 4-byte hex for chars outside BMP)
+  result = result.replace(/\\X4\\([0-9A-Fa-f]+)\\X0\\/g, (_, hex) => {
+    let decoded = '';
+    for (let i = 0; i < hex.length; i += 8) {
+      const codePoint = parseInt(hex.substring(i, i + 8), 16);
+      if (!isNaN(codePoint)) {
+        decoded += String.fromCodePoint(codePoint);
+      }
+    }
+    return decoded;
+  });
+
+  // Decode \X\XX\ patterns (ISO-8859-1 single byte)
+  result = result.replace(/\\X\\([0-9A-Fa-f]{2})/g, (_, hex) => {
+    const charCode = parseInt(hex, 16);
+    return !isNaN(charCode) ? String.fromCharCode(charCode) : '';
+  });
+
+  // Decode \S\X patterns (Latin extended, offset by 128)
+  result = result.replace(/\\S\\(.)/g, (_, char) => {
+    return String.fromCharCode(char.charCodeAt(0) + 128);
+  });
+
+  // Decode \P..\ code page switches (simplified - just remove them)
+  result = result.replace(/\\P[A-Z]?\\/g, '');
+
+  return result;
+}
+
+/**
+ * Parse and format a property value for display.
+ * Handles:
+ * - TypedValues like [IFCIDENTIFIER, '100 x 150mm'] -> display '100 x 150mm', tooltip 'Identifier'
+ * - Boolean enums like '.T.' -> 'True'
+ * - IFC encoded strings with \X2\, \X\ escape sequences
+ * - Null/undefined -> '—'
+ * - Regular values -> string conversion
+ */
+function parsePropertyValue(value: unknown): ParsedPropertyValue {
+  // Handle null/undefined
+  if (value === null || value === undefined) {
+    return { displayValue: '—' };
+  }
+
+  // Handle typed value arrays [IFCTYPENAME, actualValue]
+  if (Array.isArray(value) && value.length === 2 && typeof value[0] === 'string') {
+    const [ifcType, innerValue] = value;
+    const typeName = ifcType.toUpperCase();
+    const friendlyType = IFC_TYPE_DISPLAY_NAMES[typeName] || typeName.replace(/^IFC/, '');
+
+    // Recursively parse the inner value
+    const parsed = parsePropertyValue(innerValue);
+    return {
+      displayValue: parsed.displayValue,
+      ifcType: friendlyType,
+    };
+  }
+
+  // Handle boolean enumeration values
+  if (typeof value === 'string') {
+    const upperVal = value.toUpperCase();
+    if (BOOLEAN_MAP[upperVal]) {
+      return { displayValue: BOOLEAN_MAP[upperVal], ifcType: 'Boolean' };
+    }
+
+    // Handle string that contains typed value pattern (from String(array) conversion)
+    // Pattern: "IFCTYPENAME,actualValue" or just "IFCTYPENAME," (empty value)
+    const typedMatch = value.match(/^(IFC[A-Z0-9_]+),(.*)$/i);
+    if (typedMatch) {
+      const [, ifcType, innerValue] = typedMatch;
+      const typeName = ifcType.toUpperCase();
+      const friendlyType = IFC_TYPE_DISPLAY_NAMES[typeName] || typeName.replace(/^IFC/, '');
+
+      // Handle empty value after type
+      if (!innerValue || innerValue.trim() === '') {
+        return { displayValue: '—', ifcType: friendlyType };
+      }
+
+      // Check if the inner value is a boolean
+      const upperInner = innerValue.toUpperCase().trim();
+      if (BOOLEAN_MAP[upperInner]) {
+        return { displayValue: BOOLEAN_MAP[upperInner], ifcType: friendlyType };
+      }
+
+      // Decode IFC string encoding and return
+      return { displayValue: decodeIfcString(innerValue), ifcType: friendlyType };
+    }
+
+    // Regular string - decode IFC encoding
+    return { displayValue: decodeIfcString(value) };
+  }
+
+  // Handle native booleans
+  if (typeof value === 'boolean') {
+    return { displayValue: value ? 'True' : 'False', ifcType: 'Boolean' };
+  }
+
+  // Handle numbers
+  if (typeof value === 'number') {
+    // Format numbers nicely (limit decimal places, use locale formatting)
+    const formatted = Number.isInteger(value)
+      ? value.toLocaleString()
+      : value.toLocaleString(undefined, { maximumFractionDigits: 6 });
+    return { displayValue: formatted };
+  }
+
+  // Fallback for other types
+  return { displayValue: String(value) };
+}
+
+export function PropertiesPanel() {
+  const selectedEntityId = useViewerStore((s) => s.selectedEntityId);
+  const selectedEntity = useViewerStore((s) => s.selectedEntity);
+  const selectedEntities = useViewerStore((s) => s.selectedEntities);
+  const selectedModelId = useViewerStore((s) => s.selectedModelId);
+  const cameraCallbacks = useViewerStore((s) => s.cameraCallbacks);
+  const toggleEntityVisibility = useViewerStore((s) => s.toggleEntityVisibility);
+  const isEntityVisible = useViewerStore((s) => s.isEntityVisible);
+  const { query, ifcDataStore, models, getQueryForModel } = useIfc();
+
+  // Get model-aware query based on selectedEntity
+  const { modelQuery, model } = useMemo(() => {
+    // If we have a selectedEntity with modelId, use that model's query
+    if (selectedEntity && selectedEntity.modelId !== 'legacy') {
+      const m = models.get(selectedEntity.modelId);
+      if (m) {
+        return {
+          modelQuery: new IfcQuery(m.ifcDataStore),
+          model: m,
+        };
+      }
+    }
+    // Fallback to legacy query
+    return { modelQuery: query, model: null };
+  }, [selectedEntity, models, query]);
+
+  // Use model-aware data store
+  const activeDataStore = model?.ifcDataStore ?? ifcDataStore;
+
+  // Subscribe to mutation views and version to trigger re-render when mutations change
+  const mutationViews = useViewerStore((s) => s.mutationViews);
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
+  const getMutationView = useViewerStore((s) => s.getMutationView);
+  const registerMutationView = useViewerStore((s) => s.registerMutationView);
+
+  // Ensure mutation view exists for editing - creates it on-demand if needed
+  useEffect(() => {
+    if (!model || !selectedEntity || selectedEntity.modelId === 'legacy') return;
+
+    const modelId = selectedEntity.modelId;
+    let mutationView = getMutationView(modelId);
+    if (mutationView) return; // Already exists
+
+    // Create new mutation view
+    const dataStore = model.ifcDataStore;
+    mutationView = new MutablePropertyView(dataStore.properties || null, modelId);
+
+    // Set up on-demand property extractor if available
+    if (dataStore.onDemandPropertyMap && dataStore.source?.length > 0) {
+      mutationView.setOnDemandExtractor((entityId: number) => {
+        return extractPropertiesOnDemand(dataStore as IfcDataStore, entityId);
+      });
+    }
+
+    registerMutationView(modelId, mutationView);
+  }, [model, selectedEntity, getMutationView, registerMutationView]);
+
+  // Copy feedback state - must be before any early returns (Rules of Hooks)
+  const [copied, setCopied] = useState(false);
+
+  // Edit mode toggle - allows inline property editing
+  const [editMode, setEditMode] = useState(false);
+
+  const copyToClipboard = useCallback((text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }, []);
+
+  // Get spatial location info
+  // IMPORTANT: Use selectedEntity.expressId (original ID) for IfcDataStore lookups
+  // selectedEntityId is a globalId which only works with offset=0 (first model)
+  const spatialInfo = useMemo(() => {
+    const originalExpressId = selectedEntity?.expressId;
+    if (!originalExpressId || !activeDataStore?.spatialHierarchy) return null;
+
+    const hierarchy = activeDataStore.spatialHierarchy;
+    // Use O(1) lookup instead of O(n) includes() search
+    const storeyId = hierarchy.elementToStorey.get(originalExpressId);
+
+    if (!storeyId) return null;
+
+    // Get height: try pre-computed, then properties/quantities, then calculate from elevations
+    let height = hierarchy.storeyHeights?.get(storeyId);
+
+    if (height === undefined && activeDataStore.properties) {
+      for (const pset of activeDataStore.properties.getForEntity(storeyId)) {
+        for (const prop of pset.properties) {
+          const propName = prop.name.toLowerCase();
+          if (['grossheight', 'netheight', 'height'].includes(propName)) {
+            const val = parseFloat(String(prop.value));
+            if (!isNaN(val) && val > 0) {
+              height = val;
+              break;
+            }
+          }
+        }
+        if (height !== undefined) break;
+      }
+    }
+
+    if (height === undefined && activeDataStore.quantities) {
+      for (const qto of activeDataStore.quantities.getForEntity(storeyId)) {
+        for (const qty of qto.quantities) {
+          const qtyName = qty.name.toLowerCase();
+          if (['grossheight', 'netheight', 'height'].includes(qtyName) && typeof qty.value === 'number' && qty.value > 0) {
+            height = qty.value;
+            break;
+          }
+        }
+        if (height !== undefined) break;
+      }
+    }
+
+    // Fallback: calculate from elevation difference to next storey
+    if (height === undefined && hierarchy.storeyElevations.size > 1) {
+      const currentElevation = hierarchy.storeyElevations.get(storeyId);
+      if (currentElevation !== undefined) {
+        // Find next storey with higher elevation (O(n) but only when height missing)
+        let nextElevation: number | undefined;
+        for (const [, elev] of hierarchy.storeyElevations) {
+          if (elev > currentElevation && (nextElevation === undefined || elev < nextElevation)) {
+            nextElevation = elev;
+          }
+        }
+        if (nextElevation !== undefined) {
+          height = nextElevation - currentElevation;
+        }
+      }
+    }
+
+    return {
+      storeyId,
+      storeyName: activeDataStore.entities.getName(storeyId) || `Storey #${storeyId}`,
+      elevation: hierarchy.storeyElevations.get(storeyId),
+      height,
+    };
+  }, [selectedEntity, activeDataStore]);
+
+  // Get entity node - must be computed before early return to maintain hook order
+  // IMPORTANT: Use selectedEntity.expressId (original ID) for IfcDataStore lookups
+  const entityNode = useMemo(() => {
+    const originalExpressId = selectedEntity?.expressId;
+    if (!originalExpressId || !modelQuery) return null;
+    return modelQuery.entity(originalExpressId);
+  }, [selectedEntity, modelQuery]);
+
+  // Unified property/quantity access - EntityNode handles on-demand extraction automatically
+  // These hooks must be called before any early return to maintain hook order
+  // Use MutablePropertyView as primary source when available (it handles base + mutations)
+  const properties: PropertySet[] = useMemo(() => {
+    let modelId = selectedEntity?.modelId;
+    const expressId = selectedEntity?.expressId;
+
+    // Normalize legacy model ID (selection uses 'legacy', mutation views use '__legacy__')
+    if (modelId === 'legacy') {
+      modelId = '__legacy__';
+    }
+
+    // DEBUG: Log what we're working with
+    console.log('[PropertiesPanel] modelId:', modelId, 'expressId:', expressId, 'mutationVersion:', mutationVersion);
+    console.log('[PropertiesPanel] mutationViews keys:', [...mutationViews.keys()]);
+
+    // Try to get properties from mutation view first (handles both base and mutations)
+    const mutationView = modelId ? mutationViews.get(modelId) : null;
+    console.log('[PropertiesPanel] mutationView exists:', !!mutationView);
+
+    if (mutationView && expressId) {
+      // DEBUG: Log mutation view state
+      const allMutations = mutationView.getMutations();
+      console.log('[PropertiesPanel] All mutations in view:', allMutations.length, allMutations);
+
+      // Get merged properties from mutation view (base + mutations applied)
+      const mergedProps = mutationView.getForEntity(expressId);
+      console.log('[PropertiesPanel] mergedProps from getForEntity:', mergedProps.length, mergedProps);
+
+      // Get list of actual mutations to track which properties changed
+      const mutations = mutationView.getMutationsForEntity(expressId);
+      console.log('[PropertiesPanel] mutations for this entity:', mutations.length, mutations);
+
+      // Build a set of mutated property keys for quick lookup
+      const mutatedKeys = new Set<string>();
+      const newPsetNames = new Set<string>();
+      for (const m of mutations) {
+        if (m.psetName && m.propName) {
+          mutatedKeys.add(`${m.psetName}:${m.propName}`);
+        }
+        // Track property sets that were created (not in original model)
+        if (m.type === 'CREATE_PROPERTY_SET' && m.psetName) {
+          newPsetNames.add(m.psetName);
+        }
+        // Also mark as new pset if this is a CREATE_PROPERTY for a pset that doesn't exist in base
+        if (m.type === 'CREATE_PROPERTY' && m.psetName) {
+          // Check if we have base properties to compare
+          const baseProps = entityNode?.properties() ?? [];
+          const existsInBase = baseProps.some(p => p.name === m.psetName);
+          if (!existsInBase) {
+            newPsetNames.add(m.psetName);
+          }
+        }
+      }
+
+      // If mutation view returned properties, use them
+      if (mergedProps.length > 0) {
+        return mergedProps.map(pset => ({
+          name: pset.name,
+          properties: pset.properties.map(p => ({
+            name: p.name,
+            value: p.value,
+            isMutated: mutatedKeys.has(`${pset.name}:${p.name}`),
+          })),
+          isNewPset: newPsetNames.has(pset.name),
+        }));
+      }
+    }
+
+    // Fallback to entity node properties (no mutations or mutation view not available)
+    if (!entityNode) return [];
+
+    const rawProps = entityNode.properties();
+    return rawProps.map(pset => ({
+      name: pset.name,
+      properties: pset.properties.map(p => ({ name: p.name, value: p.value, isMutated: false })),
+      isNewPset: false,
+    }));
+  }, [entityNode, selectedEntity, mutationViews, mutationVersion]);
+
+  const quantities: QuantitySet[] = useMemo(() => {
+    if (!entityNode) return [];
+    return entityNode.quantities();
+  }, [entityNode]);
+
+  // Build attributes array for display - must be before early return to maintain hook order
+  // Note: GlobalId is intentionally excluded since it's shown in the dedicated GUID field above
+  const attributes = useMemo(() => {
+    if (!entityNode) return [];
+    const attrs: Array<{ name: string; value: string }> = [];
+    if (entityNode.name) attrs.push({ name: 'Name', value: entityNode.name });
+    if (entityNode.description) attrs.push({ name: 'Description', value: entityNode.description });
+    if (entityNode.objectType) attrs.push({ name: 'ObjectType', value: entityNode.objectType });
+    return attrs;
+  }, [entityNode]);
+
+  // Model metadata display (when clicking top-level model in hierarchy)
+  if (selectedModelId) {
+    const selectedModel = models.get(selectedModelId);
+    if (selectedModel) {
+      return <ModelMetadataPanel model={selectedModel} />;
+    }
+  }
+
+  // Multi-entity selection (unified storeys) - render combined view
+  if (selectedEntities.length > 1) {
+    return (
+      <MultiEntityPanel
+        entities={selectedEntities}
+        models={models}
+        ifcDataStore={ifcDataStore}
+      />
+    );
+  }
+
+  if (!selectedEntityId || !modelQuery || !entityNode) {
+    return (
+      <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black">
+        <div className="p-3 border-b-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
+          <h2 className="font-bold uppercase tracking-wider text-xs text-zinc-900 dark:text-zinc-100">Properties</h2>
+        </div>
+        <div className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-white dark:bg-black">
+          <div className="w-16 h-16 border-2 border-dashed border-zinc-300 dark:border-zinc-800 flex items-center justify-center mb-4 bg-zinc-100 dark:bg-zinc-950">
+            <MousePointer2 className="h-8 w-8 text-zinc-400 dark:text-zinc-500" />
+          </div>
+          <p className="font-bold uppercase text-zinc-900 dark:text-zinc-100 mb-2">No Selection</p>
+          <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400 max-w-[150px]">
+            Select an element to view details
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // These are safe to access after the early return check (entityNode is confirmed non-null above)
+  const entityType = entityNode.type;
+  const entityName = entityNode.name;
+  const entityGlobalId = entityNode.globalId;
+  const entityDescription = entityNode.description;
+  const entityObjectType = entityNode.objectType;
+
+  return (
+    <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
+      {/* Entity Header */}
+      <div className="p-4 border-b-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black space-y-3">
+        <div className="flex items-start gap-3">
+          <div className="p-2 border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shrink-0 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,0.1)]">
+            <Building2 className="h-5 w-5 text-zinc-700 dark:text-zinc-300" />
+          </div>
+          <div className="flex-1 min-w-0 pt-0.5">
+            <h3 className="font-bold text-sm truncate uppercase tracking-tight text-zinc-900 dark:text-zinc-100">
+              {entityName || `${entityType}`}
+            </h3>
+            <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400">{entityType}</p>
+          </div>
+          <div className="flex gap-1 shrink-0">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="rounded-none hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                  onClick={() => {
+                    if (selectedEntityId && cameraCallbacks.frameSelection) {
+                      cameraCallbacks.frameSelection();
+                    }
+                  }}
+                >
+                  <Focus className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Zoom to</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="rounded-none hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                  onClick={() => {
+                    if (selectedEntityId) {
+                      toggleEntityVisibility(selectedEntityId);
+                    }
+                  }}
+                >
+                  {selectedEntityId && isEntityVisible(selectedEntityId) ? (
+                    <EyeOff className="h-3.5 w-3.5" />
+                  ) : (
+                    <Eye className="h-3.5 w-3.5" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {selectedEntityId && isEntityVisible(selectedEntityId) ? 'Hide' : 'Show'}
+              </TooltipContent>
+            </Tooltip>
+            {/* Edit mode toggle */}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant={editMode ? 'default' : 'ghost'}
+                  size="icon-xs"
+                  className={`rounded-none ${editMode ? 'bg-purple-600 hover:bg-purple-700 text-white' : 'hover:bg-zinc-200 dark:hover:bg-zinc-700'}`}
+                  onClick={() => setEditMode(!editMode)}
+                >
+                  <PenLine className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{editMode ? 'Exit Edit Mode' : 'Edit Properties'}</TooltipContent>
+            </Tooltip>
+          </div>
+        </div>
+
+        {/* GlobalId */}
+        {entityGlobalId && (
+          <div className={`flex items-center gap-0 border transition-colors duration-200 ${
+            copied
+              ? 'border-emerald-400 dark:border-emerald-600'
+              : 'border-zinc-200 dark:border-zinc-800'
+          }`}>
+            <code className="flex-1 text-[10px] bg-white dark:bg-zinc-950 px-2 py-1 truncate font-mono select-all text-zinc-900 dark:text-zinc-100">
+              {entityGlobalId}
+            </code>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className={`h-6 w-6 rounded-none border-l transition-all duration-200 ${
+                copied
+                  ? 'border-emerald-400 dark:border-emerald-600 bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400'
+                  : 'border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-950'
+              }`}
+              onClick={() => copyToClipboard(entityGlobalId)}
+            >
+              {copied ? (
+                <Check className="h-3 w-3" />
+              ) : (
+                <Copy className="h-3 w-3 text-zinc-600 dark:text-zinc-400" />
+              )}
+            </Button>
+          </div>
+        )}
+
+        {/* Spatial Location */}
+        {spatialInfo && (
+          <div className="flex items-center gap-2 text-xs border border-emerald-500/30 bg-emerald-50/50 dark:bg-emerald-900/10 px-2 py-1.5 text-emerald-800 dark:text-emerald-400 min-w-0">
+            <Layers className="h-3.5 w-3.5 shrink-0" />
+            <span className="font-bold uppercase tracking-wide truncate min-w-0 flex-1">{spatialInfo.storeyName}</span>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {spatialInfo.elevation !== undefined && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="text-emerald-600/70 dark:text-emerald-500/70 font-mono whitespace-nowrap">
+                      {spatialInfo.elevation >= 0 ? '+' : ''}{spatialInfo.elevation.toFixed(2)}m
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p className="text-xs">Elevation: {spatialInfo.elevation >= 0 ? '+' : ''}{spatialInfo.elevation.toFixed(2)}m from ground</p>
+                  </TooltipContent>
+                </Tooltip>
+              )}
+              {spatialInfo.height !== undefined && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="flex items-center gap-1 text-emerald-500/60 dark:text-emerald-400/60 font-mono text-[10px] whitespace-nowrap">
+                      <ArrowUpDown className="h-2.5 w-2.5 shrink-0" />
+                      <span className="hidden sm:inline">{spatialInfo.height.toFixed(2)}m</span>
+                      <span className="sm:hidden">{spatialInfo.height.toFixed(1)}m</span>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p className="text-xs">Height: {spatialInfo.height.toFixed(2)}m to next storey</p>
+                  </TooltipContent>
+                </Tooltip>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Model Source (when multiple models loaded) - below storey, less prominent */}
+        {models.size > 1 && model && (
+          <div className="flex items-center gap-2 text-[11px] px-2 py-1 text-zinc-400 dark:text-zinc-500 min-w-0">
+            <FileBox className="h-3 w-3 shrink-0" />
+            <span className="font-mono truncate min-w-0 flex-1">{model.name}</span>
+          </div>
+        )}
+      </div>
+
+      {/* IFC Attributes */}
+      {attributes.length > 0 && (
+        <Collapsible defaultOpen className="border-b">
+          <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
+            <Tag className="h-4 w-4 text-muted-foreground" />
+            <span className="font-medium text-sm">Attributes</span>
+            <span className="text-xs text-muted-foreground ml-auto">{attributes.length}</span>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="divide-y border-t">
+              {attributes.map((attr) => (
+                <div key={attr.name} className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
+                  <span className="text-muted-foreground truncate" title={attr.name}>{attr.name}</span>
+                  <div className="overflow-x-auto scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 min-w-0">
+                    <span className="font-medium whitespace-nowrap" title={attr.value}>
+                      {attr.value}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+
+      {/* Tabs */}
+      <Tabs defaultValue="properties" className="flex-1 flex flex-col overflow-hidden">
+        <TabsList className="tabs-list w-full justify-start rounded-none h-10 p-0" style={{ backgroundColor: 'var(--tabs-bg)', borderBottom: '1px solid var(--tabs-border)' }}>
+          <TabsTrigger
+            value="properties"
+            className="tab-trigger flex-1 rounded-none border-b-2 border-transparent data-[state=active]:border-primary uppercase text-xs tracking-wider h-full"
+          >
+            <FileText className="h-3.5 w-3.5 mr-2" />
+            Properties
+          </TabsTrigger>
+          <TabsTrigger
+            value="quantities"
+            className="tab-trigger flex-1 rounded-none border-b-2 border-transparent data-[state=active]:border-primary uppercase text-xs tracking-wider h-full"
+          >
+            <Calculator className="h-3.5 w-3.5 mr-2" />
+            Quantities
+          </TabsTrigger>
+        </TabsList>
+
+        <ScrollArea className="flex-1 bg-white dark:bg-black">
+          <TabsContent value="properties" className="m-0 p-3 overflow-hidden">
+            {/* Edit toolbar - only shown when edit mode is active */}
+            {editMode && selectedEntity && (
+              <div className="flex items-center justify-between gap-2 mb-3 pb-2 border-b border-purple-200 dark:border-purple-800 bg-purple-50/30 dark:bg-purple-950/20 -mx-3 -mt-3 px-3 pt-3">
+                <NewPropertyDialog
+                  modelId={selectedEntity.modelId}
+                  entityId={selectedEntity.expressId}
+                  existingPsets={properties.map(p => p.name)}
+                />
+                <UndoRedoButtons modelId={selectedEntity.modelId} />
+              </div>
+            )}
+            {properties.length === 0 ? (
+              <p className="text-sm text-zinc-500 dark:text-zinc-500 text-center py-8 font-mono">No property sets</p>
+            ) : (
+              <div className="space-y-3 w-full overflow-hidden">
+                {properties.map((pset: PropertySet) => (
+                  <PropertySetCard
+                    key={pset.name}
+                    pset={pset}
+                    modelId={selectedEntity?.modelId}
+                    entityId={selectedEntity?.expressId}
+                    enableEditing={editMode}
+                  />
+                ))}
+              </div>
+            )}
+          </TabsContent>
+
+          <TabsContent value="quantities" className="m-0 p-3 overflow-hidden">
+            {quantities.length === 0 ? (
+              <p className="text-sm text-zinc-500 dark:text-zinc-500 text-center py-8 font-mono">No quantities</p>
+            ) : (
+              <div className="space-y-3 w-full overflow-hidden">
+                {quantities.map((qset: QuantitySet) => (
+                  <QuantitySetCard key={qset.name} qset={qset} />
+                ))}
+              </div>
+            )}
+          </TabsContent>
+        </ScrollArea>
+      </Tabs>
+    </div>
+  );
+}
+
+/** Multi-entity panel for unified storeys - shows data from multiple entities stacked */
+function MultiEntityPanel({
+  entities,
+  models,
+  ifcDataStore,
+}: {
+  entities: EntityRef[];
+  models: Map<string, FederatedModel>;
+  ifcDataStore: IfcDataStore | null;
+}) {
+  return (
+    <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
+      {/* Header */}
+      <div className="p-3 border-b-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black">
+        <div className="flex items-center gap-2">
+          <Layers className="h-4 w-4 text-emerald-600" />
+          <h2 className="font-bold uppercase tracking-wider text-xs text-zinc-900 dark:text-zinc-100">
+            Unified Storey
+          </h2>
+          <span className="text-[10px] font-mono bg-emerald-100 dark:bg-emerald-900 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+            {entities.length} models
+          </span>
+        </div>
+      </div>
+
+      {/* Scrollable content with each entity's data */}
+      <ScrollArea className="flex-1">
+        <div className="divide-y-2 divide-zinc-200 dark:divide-zinc-800">
+          {entities.map((entityRef, index) => (
+            <EntityDataSection
+              key={`${entityRef.modelId}-${entityRef.expressId}`}
+              entityRef={entityRef}
+              models={models}
+              ifcDataStore={ifcDataStore}
+              showModelName={true}
+            />
+          ))}
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+/** Renders data for a single entity (used in multi-entity panel) */
+function EntityDataSection({
+  entityRef,
+  models,
+  ifcDataStore,
+  showModelName,
+}: {
+  entityRef: EntityRef;
+  models: Map<string, FederatedModel>;
+  ifcDataStore: IfcDataStore | null;
+  showModelName: boolean;
+}) {
+  // Get the appropriate data store and query
+  const { dataStore, model } = useMemo(() => {
+    if (entityRef.modelId !== 'legacy') {
+      const m = models.get(entityRef.modelId);
+      if (m) {
+        return { dataStore: m.ifcDataStore, model: m };
+      }
+    }
+    return { dataStore: ifcDataStore, model: null };
+  }, [entityRef.modelId, models, ifcDataStore]);
+
+  const query = useMemo(() => {
+    return dataStore ? new IfcQuery(dataStore) : null;
+  }, [dataStore]);
+
+  const entityNode = useMemo(() => {
+    if (!query) return null;
+    return query.entity(entityRef.expressId);
+  }, [query, entityRef.expressId]);
+
+  // Get properties and quantities
+  const properties: PropertySet[] = useMemo(() => {
+    if (!entityNode) return [];
+    const rawProps = entityNode.properties();
+    return rawProps.map(pset => ({
+      name: pset.name,
+      properties: pset.properties.map(p => ({ name: p.name, value: p.value })),
+    }));
+  }, [entityNode]);
+
+  const quantities: QuantitySet[] = useMemo(() => {
+    if (!entityNode) return [];
+    return entityNode.quantities();
+  }, [entityNode]);
+
+  // Get attributes
+  // Note: GlobalId is intentionally excluded since it's shown in the dedicated GUID field above
+  const attributes = useMemo(() => {
+    if (!entityNode) return [];
+    const attrs: Array<{ name: string; value: string }> = [];
+    if (entityNode.name) attrs.push({ name: 'Name', value: entityNode.name });
+    if (entityNode.description) attrs.push({ name: 'Description', value: entityNode.description });
+    if (entityNode.objectType) attrs.push({ name: 'ObjectType', value: entityNode.objectType });
+    return attrs;
+  }, [entityNode]);
+
+  // Get elevation info
+  const elevationInfo = useMemo(() => {
+    if (!dataStore?.spatialHierarchy) return null;
+    const elevation = dataStore.spatialHierarchy.storeyElevations.get(entityRef.expressId);
+    return elevation !== undefined ? elevation : null;
+  }, [dataStore, entityRef.expressId]);
+
+  if (!entityNode) {
+    return (
+      <div className="p-4 text-center text-zinc-500 text-sm">
+        Unable to load entity data
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white dark:bg-black">
+      {/* Entity Header with model name */}
+      <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50 space-y-2">
+        {showModelName && model && (
+          <div className="flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+            <FileBox className="h-3 w-3" />
+            <span className="font-mono truncate">{model.name}</span>
+          </div>
+        )}
+        <div className="flex items-center gap-2">
+          <Layers className="h-4 w-4 text-emerald-600" />
+          <div className="flex-1 min-w-0">
+            <h3 className="font-bold text-sm truncate text-zinc-900 dark:text-zinc-100">
+              {entityNode.name || `${entityNode.type} #${entityRef.expressId}`}
+            </h3>
+            <p className="text-xs font-mono text-zinc-500">{entityNode.type}</p>
+          </div>
+          {elevationInfo !== null && (
+            <span className="text-[10px] font-mono bg-emerald-100 dark:bg-emerald-950 px-1.5 py-0.5 border border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400">
+              {elevationInfo >= 0 ? '+' : ''}{elevationInfo.toFixed(2)}m
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Attributes */}
+      {attributes.length > 0 && (
+        <Collapsible defaultOpen className="border-b border-zinc-200 dark:border-zinc-800">
+          <CollapsibleTrigger className="flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
+            <Tag className="h-3 w-3 text-zinc-400" />
+            <span className="font-medium">Attributes</span>
+            <span className="text-[10px] text-zinc-400 ml-auto">{attributes.length}</span>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="divide-y divide-zinc-100 dark:divide-zinc-900 border-t border-zinc-100 dark:border-zinc-900">
+              {attributes.map((attr) => (
+                <div key={attr.name} className="grid grid-cols-[minmax(60px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-xs">
+                  <span className="text-zinc-500 truncate" title={attr.name}>{attr.name}</span>
+                  <div className="overflow-x-auto scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 min-w-0">
+                    <span className="font-medium whitespace-nowrap">{attr.value}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+
+      {/* Properties */}
+      {properties.length > 0 && (
+        <Collapsible defaultOpen className="border-b border-zinc-200 dark:border-zinc-800">
+          <CollapsibleTrigger className="flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
+            <FileText className="h-3 w-3 text-zinc-400" />
+            <span className="font-medium">Properties</span>
+            <span className="text-[10px] text-zinc-400 ml-auto">{properties.length} sets</span>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="p-2 pt-0 space-y-2">
+              {properties.map((pset) => (
+                <PropertySetCard key={pset.name} pset={pset} />
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+
+      {/* Quantities */}
+      {quantities.length > 0 && (
+        <Collapsible defaultOpen className="border-b border-zinc-200 dark:border-zinc-800">
+          <CollapsibleTrigger className="flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
+            <Calculator className="h-3 w-3 text-zinc-400" />
+            <span className="font-medium">Quantities</span>
+            <span className="text-[10px] text-zinc-400 ml-auto">{quantities.length} sets</span>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="p-2 pt-0 space-y-2">
+              {quantities.map((qset) => (
+                <QuantitySetCard key={qset.name} qset={qset} />
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+    </div>
+  );
+}
+
+interface PropertySetCardProps {
+  pset: PropertySet;
+  modelId?: string;
+  entityId?: number;
+  enableEditing?: boolean;
+}
+
+function PropertySetCard({ pset, modelId, entityId, enableEditing }: PropertySetCardProps) {
+  // Check if any property in this set is mutated
+  const hasMutations = pset.properties.some(p => p.isMutated);
+  const isNewPset = pset.isNewPset;
+
+  // Dynamic styling based on mutation state
+  const borderClass = isNewPset
+    ? 'border-2 border-amber-400/50 dark:border-amber-500/30'
+    : hasMutations
+    ? 'border-2 border-purple-300/50 dark:border-purple-500/30'
+    : 'border-2 border-zinc-200 dark:border-zinc-800';
+
+  const bgClass = isNewPset
+    ? 'bg-amber-50/30 dark:bg-amber-950/20'
+    : hasMutations
+    ? 'bg-purple-50/20 dark:bg-purple-950/10'
+    : 'bg-white dark:bg-zinc-950';
+
+  return (
+    <Collapsible defaultOpen className={`${borderClass} ${bgClass} group w-full max-w-full overflow-hidden`}>
+      <CollapsibleTrigger className="flex items-center gap-2 w-full p-2.5 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left transition-colors overflow-hidden">
+        {isNewPset && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Sparkles className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+            </TooltipTrigger>
+            <TooltipContent>New property set (not in original model)</TooltipContent>
+          </Tooltip>
+        )}
+        {hasMutations && !isNewPset && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <PenLine className="h-3.5 w-3.5 text-purple-500 shrink-0" />
+            </TooltipTrigger>
+            <TooltipContent>Has modified properties</TooltipContent>
+          </Tooltip>
+        )}
+        <span className="font-bold text-xs text-zinc-900 dark:text-zinc-100 truncate flex-1 min-w-0">{decodeIfcString(pset.name)}</span>
+        <span className="text-[10px] font-mono bg-zinc-100 dark:bg-zinc-900 px-1.5 py-0.5 border border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 shrink-0">{pset.properties.length}</span>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="border-t-2 border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-900">
+          {pset.properties.map((prop: { name: string; value: unknown; isMutated?: boolean }) => {
+            const parsed = parsePropertyValue(prop.value);
+            const decodedName = decodeIfcString(prop.name);
+            const isMutated = prop.isMutated;
+
+            return (
+              <div
+                key={prop.name}
+                className={`flex items-start justify-between gap-2 px-3 py-2 text-xs group/prop ${
+                  isMutated
+                    ? 'bg-purple-50/50 dark:bg-purple-950/30 hover:bg-purple-100/50 dark:hover:bg-purple-900/30'
+                    : 'hover:bg-zinc-50/50 dark:hover:bg-zinc-900/50'
+                }`}
+              >
+                <div className="flex flex-col gap-0.5 flex-1 min-w-0">
+                  {/* Property name with type tooltip and mutation indicator */}
+                  <div className="flex items-center gap-1.5">
+                    {isMutated && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Badge variant="secondary" className="h-4 px-1 text-[9px] bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-700">
+                            edited
+                          </Badge>
+                        </TooltipTrigger>
+                        <TooltipContent>This property has been modified</TooltipContent>
+                      </Tooltip>
+                    )}
+                    {parsed.ifcType ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className={`font-medium cursor-help break-words ${isMutated ? 'text-purple-600 dark:text-purple-400' : 'text-zinc-500 dark:text-zinc-400'}`}>
+                            {decodedName}
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-[10px]">
+                          <span className="text-zinc-400">{parsed.ifcType}</span>
+                        </TooltipContent>
+                      </Tooltip>
+                    ) : (
+                      <span className={`font-medium break-words ${isMutated ? 'text-purple-600 dark:text-purple-400' : 'text-zinc-500 dark:text-zinc-400'}`}>
+                        {decodedName}
+                      </span>
+                    )}
+                  </div>
+                  {/* Property value - use PropertyEditor if editing enabled */}
+                  {enableEditing && modelId && entityId ? (
+                    <PropertyEditor
+                      modelId={modelId}
+                      entityId={entityId}
+                      psetName={pset.name}
+                      propName={prop.name}
+                      currentValue={prop.value}
+                    />
+                  ) : (
+                    <span className={`font-mono select-all break-words ${isMutated ? 'text-purple-900 dark:text-purple-100 font-semibold' : 'text-zinc-900 dark:text-zinc-100'}`}>
+                      {parsed.displayValue}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+/** Maps quantity type to friendly name for tooltip */
+const QUANTITY_TYPE_NAMES: Record<number, string> = {
+  0: 'Length',
+  1: 'Area',
+  2: 'Volume',
+  3: 'Count',
+  4: 'Weight',
+  5: 'Time',
+};
+
+function QuantitySetCard({ qset }: { qset: QuantitySet }) {
+  const formatValue = (value: number, type: number): string => {
+    const formatted = value.toLocaleString(undefined, { maximumFractionDigits: 3 });
+    switch (type) {
+      case 0: return `${formatted} m`;
+      case 1: return `${formatted} m²`;
+      case 2: return `${formatted} m³`;
+      case 3: return formatted;
+      case 4: return `${formatted} kg`;
+      case 5: return `${formatted} s`;
+      default: return formatted;
+    }
+  };
+
+  return (
+    <Collapsible defaultOpen className="border-2 border-blue-200 dark:border-blue-800 bg-blue-50/20 dark:bg-blue-950/20 w-full max-w-full overflow-hidden">
+      <CollapsibleTrigger className="flex items-center gap-2 w-full p-2.5 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-left transition-colors overflow-hidden">
+        <span className="font-bold text-xs text-blue-700 dark:text-blue-400 truncate flex-1 min-w-0">{decodeIfcString(qset.name)}</span>
+        <span className="text-[10px] font-mono bg-blue-100 dark:bg-blue-900/50 px-1.5 py-0.5 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300 shrink-0">{qset.quantities.length}</span>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="border-t-2 border-blue-200 dark:border-blue-800 divide-y divide-blue-100 dark:divide-blue-900/30">
+          {qset.quantities.map((q: { name: string; value: number; type: number }) => {
+            const decodedName = decodeIfcString(q.name);
+            const typeName = QUANTITY_TYPE_NAMES[q.type];
+            return (
+              <div key={q.name} className="flex flex-col gap-0.5 px-3 py-2 text-xs hover:bg-blue-50/50 dark:hover:bg-blue-900/20">
+                {/* Quantity name with type tooltip */}
+                {typeName ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="text-zinc-500 dark:text-zinc-400 font-medium cursor-help break-words">
+                        {decodedName}
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="text-[10px]">
+                      <span className="text-zinc-400">{typeName}</span>
+                    </TooltipContent>
+                  </Tooltip>
+                ) : (
+                  <span className="text-zinc-500 dark:text-zinc-400 font-medium break-words">
+                    {decodedName}
+                  </span>
+                )}
+                {/* Quantity value */}
+                <span className="font-mono text-blue-700 dark:text-blue-400 select-all break-words">
+                  {formatValue(q.value, q.type)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+/** Model metadata panel - displays file info, schema version, entity counts, etc. */
+function ModelMetadataPanel({ model }: { model: FederatedModel }) {
+  const dataStore = model.ifcDataStore;
+
+  // Format file size
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  // Format date
+  const formatDate = (timestamp: number): string => {
+    return new Date(timestamp).toLocaleString();
+  };
+
+  // Get IfcProject data if available
+  const projectData = useMemo(() => {
+    if (!dataStore?.spatialHierarchy?.project) return null;
+    const project = dataStore.spatialHierarchy.project;
+    const projectId = project.expressId;
+
+    // Get project entity attributes
+    const name = dataStore.entities.getName(projectId);
+    const globalId = dataStore.entities.getGlobalId(projectId);
+    const description = dataStore.entities.getDescription(projectId);
+
+    // Get project properties
+    const properties: PropertySet[] = [];
+    if (dataStore.properties) {
+      for (const pset of dataStore.properties.getForEntity(projectId)) {
+        properties.push({
+          name: pset.name,
+          properties: pset.properties.map(p => ({ name: p.name, value: p.value })),
+        });
+      }
+    }
+
+    return { name, globalId, description, properties };
+  }, [dataStore]);
+
+  // Count storeys and elements
+  const stats = useMemo(() => {
+    if (!dataStore?.spatialHierarchy) {
+      return { storeys: 0, elementsWithGeometry: 0 };
+    }
+    const storeys = dataStore.spatialHierarchy.byStorey.size;
+    let elementsWithGeometry = 0;
+    for (const elements of dataStore.spatialHierarchy.byStorey.values()) {
+      elementsWithGeometry += (elements as number[]).length;
+    }
+    return { storeys, elementsWithGeometry };
+  }, [dataStore]);
+
+  return (
+    <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
+      {/* Header */}
+      <div className="p-4 border-b-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black space-y-3">
+        <div className="flex items-start gap-3">
+          <div className="p-2 border-2 border-primary/30 bg-primary/10 shrink-0 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,0.1)]">
+            <FileBox className="h-5 w-5 text-primary" />
+          </div>
+          <div className="flex-1 min-w-0 pt-0.5">
+            <h3 className="font-bold text-sm truncate uppercase tracking-tight text-zinc-900 dark:text-zinc-100">
+              {model.name}
+            </h3>
+            <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400">IFC Model</p>
+          </div>
+        </div>
+
+        {/* Schema badge */}
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-mono bg-primary/10 border border-primary/30 px-2 py-1 text-primary font-bold uppercase">
+            {model.schemaVersion}
+          </span>
+        </div>
+      </div>
+
+      <ScrollArea className="flex-1">
+        {/* File Information */}
+        <div className="border-b border-zinc-200 dark:border-zinc-800">
+          <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
+            <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
+              File Information
+            </h4>
+          </div>
+          <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
+            <div className="flex items-center gap-3 px-3 py-2">
+              <HardDrive className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+              <span className="text-xs text-zinc-500">File Size</span>
+              <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                {formatFileSize(model.fileSize)}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 px-3 py-2">
+              <Clock className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+              <span className="text-xs text-zinc-500">Loaded At</span>
+              <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                {formatDate(model.loadedAt)}
+              </span>
+            </div>
+            {dataStore && (
+              <div className="flex items-center gap-3 px-3 py-2">
+                <Clock className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                <span className="text-xs text-zinc-500">Parse Time</span>
+                <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                  {dataStore.parseTime.toFixed(0)} ms
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Entity Statistics */}
+        <div className="border-b border-zinc-200 dark:border-zinc-800">
+          <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
+            <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
+              Statistics
+            </h4>
+          </div>
+          <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
+            <div className="flex items-center gap-3 px-3 py-2">
+              <Database className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+              <span className="text-xs text-zinc-500">Total Entities</span>
+              <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                {dataStore?.entityCount?.toLocaleString() ?? 'N/A'}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 px-3 py-2">
+              <Layers className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+              <span className="text-xs text-zinc-500">Building Storeys</span>
+              <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                {stats.storeys}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 px-3 py-2">
+              <Building2 className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+              <span className="text-xs text-zinc-500">Elements with Geometry</span>
+              <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                {stats.elementsWithGeometry.toLocaleString()}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 px-3 py-2">
+              <Hash className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+              <span className="text-xs text-zinc-500">Max Express ID</span>
+              <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                {model.maxExpressId.toLocaleString()}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* IfcProject Data */}
+        {projectData && (
+          <div className="border-b border-zinc-200 dark:border-zinc-800">
+            <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
+              <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
+                Project Information
+              </h4>
+            </div>
+            <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
+              {projectData.name && (
+                <div className="flex items-center gap-3 px-3 py-2">
+                  <Tag className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                  <span className="text-xs text-zinc-500">Name</span>
+                  <span className="text-xs font-medium text-zinc-900 dark:text-zinc-100 ml-auto truncate max-w-[60%]">
+                    {projectData.name}
+                  </span>
+                </div>
+              )}
+              {projectData.description && (
+                <div className="flex items-start gap-3 px-3 py-2">
+                  <FileText className="h-3.5 w-3.5 text-zinc-400 shrink-0 mt-0.5" />
+                  <span className="text-xs text-zinc-500 shrink-0">Description</span>
+                  <span className="text-xs text-zinc-900 dark:text-zinc-100 ml-auto text-right max-w-[60%]">
+                    {projectData.description}
+                  </span>
+                </div>
+              )}
+              {projectData.globalId && (
+                <div className="flex items-center gap-3 px-3 py-2">
+                  <Hash className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                  <span className="text-xs text-zinc-500">GlobalId</span>
+                  <code className="text-[10px] font-mono text-zinc-600 dark:text-zinc-400 ml-auto truncate max-w-[60%]">
+                    {projectData.globalId}
+                  </code>
+                </div>
+              )}
+            </div>
+
+            {/* Project Properties */}
+            {projectData.properties.length > 0 && (
+              <div className="p-3 pt-0 space-y-2">
+                {projectData.properties.map((pset) => (
+                  <PropertySetCard key={pset.name} pset={pset} />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </ScrollArea>
+    </div>
+  );
+}
