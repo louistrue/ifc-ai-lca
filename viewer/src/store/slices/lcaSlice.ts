@@ -98,19 +98,36 @@ export function extractMaterialsFromIFC(
   const entityIds = geometryMeshes?.map(m => m.expressId) || [];
 
   // Try to extract materials from properties
-  if (ifcDataStore.properties) {
-    for (const [entityId, propSets] of ifcDataStore.properties) {
-      // Look for material-related property sets
-      for (const [psetName, props] of propSets) {
-        // Check for material name in properties
-        const materialName = props.get('Material') as string ||
-                            props.get('MaterialName') as string ||
-                            props.get('material') as string;
+  // Handle different possible data structures from ifc-lite
+  if (ifcDataStore.properties && typeof ifcDataStore.properties[Symbol.iterator] === 'function') {
+    try {
+      for (const [entityId, propSets] of ifcDataStore.properties) {
+        if (!propSets || typeof propSets[Symbol.iterator] !== 'function') continue;
 
-        if (materialName && typeof materialName === 'string') {
-          addOrUpdateMaterial(materialMap, materialName, entityId, props, ifcDataStore.quantities?.get(entityId));
+        // Look for material-related property sets
+        for (const [psetName, props] of propSets) {
+          if (!props) continue;
+
+          // Handle both Map and Object formats
+          const getProp = (key: string) => {
+            if (props instanceof Map) return props.get(key);
+            if (typeof props === 'object') return (props as Record<string, unknown>)[key];
+            return undefined;
+          };
+
+          // Check for material name in properties
+          const materialName = getProp('Material') as string ||
+                              getProp('MaterialName') as string ||
+                              getProp('material') as string;
+
+          if (materialName && typeof materialName === 'string') {
+            const propsMap = props instanceof Map ? props : new Map(Object.entries(props || {}));
+            addOrUpdateMaterial(materialMap, materialName, entityId, propsMap, ifcDataStore.quantities?.get(entityId));
+          }
         }
       }
+    } catch (err) {
+      console.warn('[LCA] Failed to extract materials from properties:', err);
     }
   }
 

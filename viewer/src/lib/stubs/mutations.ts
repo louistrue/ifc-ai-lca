@@ -23,6 +23,10 @@ export class MutablePropertyView {
   removePropertySet(_entityId: number, _psetName: string) {}
   addProperty(_entityId: number, _psetName: string, _propName: string, _value: unknown) {}
   removeProperty(_entityId: number, _psetName: string, _propName: string) {}
+  setOnDemandExtractor(_extractor: unknown) {}
+  hasChanges() { return false; }
+  getChanges() { return []; }
+  clearChanges() {}
 }
 
 export class BulkQueryEngine {
