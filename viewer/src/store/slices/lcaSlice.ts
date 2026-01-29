@@ -141,38 +141,26 @@ export function extractMaterialsFromIFC(
     try {
       if (!ifcDataStore.quantities) return { volume, area, weight };
 
-      // Handle both Map and Object access
-      let qsets: unknown;
-      if (ifcDataStore.quantities instanceof Map) {
-        qsets = ifcDataStore.quantities.get(entityId);
-      } else if (typeof ifcDataStore.quantities === 'object') {
-        qsets = (ifcDataStore.quantities as Record<number, unknown>)[entityId];
-      }
+      // ifc-lite uses getForEntity method
+      if (typeof ifcDataStore.quantities.getForEntity === 'function') {
+        const qsets = ifcDataStore.quantities.getForEntity(entityId);
+        if (Array.isArray(qsets)) {
+          for (const qset of qsets) {
+            if (!qset.quantities) continue;
+            for (const qty of qset.quantities) {
+              const lowerName = (qty.name || '').toLowerCase();
+              const value = qty.value || 0;
 
-      if (!qsets) return { volume, area, weight };
-
-      // Iterate through quantity sets
-      const iterateQsets = qsets instanceof Map ? qsets : (typeof qsets === 'object' ? Object.entries(qsets) : []);
-      for (const entry of iterateQsets) {
-        const quantities = entry instanceof Array ? entry[1] : entry;
-        if (!quantities) continue;
-
-        const iterateQuantities = quantities instanceof Map ? quantities : (typeof quantities === 'object' ? Object.entries(quantities) : []);
-        for (const qEntry of iterateQuantities) {
-          const [qName, qValue] = qEntry instanceof Array ? qEntry : [qEntry, null];
-          if (!qValue || typeof qValue !== 'object') continue;
-
-          const lowerName = String(qName).toLowerCase();
-          const value = (qValue as { value?: number }).value || 0;
-
-          if (lowerName.includes('volume') || lowerName.includes('netvolume')) {
-            volume += value;
-          }
-          if (lowerName.includes('area') || lowerName.includes('netarea')) {
-            area += value;
-          }
-          if (lowerName.includes('weight') || lowerName.includes('mass')) {
-            weight += value;
+              if (lowerName.includes('volume') || lowerName.includes('netvolume')) {
+                volume += value;
+              }
+              if (lowerName.includes('area') || lowerName.includes('netarea') || lowerName.includes('sidearea')) {
+                area += value;
+              }
+              if (lowerName.includes('weight') || lowerName.includes('mass')) {
+                weight += value;
+              }
+            }
           }
         }
       }
