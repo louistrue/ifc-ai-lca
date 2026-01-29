@@ -20,6 +20,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      '@ifc-lite/mutations': path.resolve(__dirname, './src/lib/stubs/mutations.ts'),
     },
   },
   server: {
