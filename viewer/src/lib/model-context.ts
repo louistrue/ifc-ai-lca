@@ -2,12 +2,40 @@
  * Model Context Builder for EPD Agent
  * Extracts rich IFC model data in a structured, size-controlled format
  * for intelligent EPD matching with full model object context.
+ *
+ * OPTIMIZED FOR LARGE MODELS:
+ * - Compact summaries with aggregated data
+ * - Size limits on element details
+ * - Sampling for very large models
+ * - Prioritizes high-impact materials
  */
 
 import type { FederatedModel } from '../store/types';
-import type { ExtractedMaterial, LCAResults, EPDMatch } from './epd/types';
+import type { ExtractedMaterial, LCAResults } from './epd/types';
 import type { SpatialHierarchy, SpatialNode } from '@ifc-lite/data';
 import { IfcTypeEnum } from '@ifc-lite/data';
+
+// ============================================================================
+// Configuration - Size Limits for Large Models
+// ============================================================================
+
+/** Maximum materials to include in summary (rest are aggregated) */
+export const MAX_MATERIALS_IN_SUMMARY = 50;
+
+/** Maximum storeys to include in summary */
+export const MAX_STOREYS_IN_SUMMARY = 20;
+
+/** Maximum element types to track per material */
+export const MAX_ELEMENT_TYPES_PER_MATERIAL = 10;
+
+/** Maximum elements to return in detail queries */
+export const MAX_ELEMENTS_PER_QUERY = 50;
+
+/** Maximum properties to include per element */
+export const MAX_PROPERTIES_PER_ELEMENT = 20;
+
+/** Element count threshold for "large model" optimizations */
+export const LARGE_MODEL_THRESHOLD = 10000;
 
 // ============================================================================
 // Types
@@ -436,14 +464,18 @@ export function getElementDetails(
         storeyName = entities.getName(storeyId) || `Storey #${storeyId}`;
       }
 
-      // Get key properties (flattened)
+      // Get key properties (flattened, with size limit)
       const properties: Record<string, string | number | boolean> = {};
+      let propCount = 0;
       const props = model.ifcDataStore.properties;
       if (props?.getForEntity) {
         const psets = props.getForEntity(originalId);
         if (Array.isArray(psets)) {
-          for (const pset of psets) {
+          outer: for (const pset of psets) {
             for (const prop of pset.properties || []) {
+              // Limit properties per element for large models
+              if (propCount >= MAX_PROPERTIES_PER_ELEMENT) break outer;
+
               // Handle both property formats (name/value and property_name/property_value)
               const propAny = prop as unknown as Record<string, unknown>;
               const pname = (propAny.name || propAny.property_name) as string | undefined;
@@ -453,6 +485,7 @@ export function getElementDetails(
                 // Only include scalar values
                 if (typeof pvalue === 'string' || typeof pvalue === 'number' || typeof pvalue === 'boolean') {
                   properties[pname] = pvalue;
+                  propCount++;
                 }
               }
             }
@@ -646,4 +679,64 @@ export function getHighImpactElements(
       materialName: material?.name || 'Unknown',
     };
   });
+}
+
+// ============================================================================
+// Large Model Helpers
+// ============================================================================
+
+/**
+ * Estimate the JSON payload size for model context
+ * Useful for debugging and optimization
+ */
+export function estimatePayloadSize(
+  summary: ModelSummary,
+  elementDetails?: Record<string, ElementDetail[]>
+): { summaryKB: number; detailsKB: number; totalKB: number } {
+  const summaryStr = JSON.stringify(summary);
+  const detailsStr = elementDetails ? JSON.stringify(elementDetails) : '';
+
+  const summaryKB = Math.round(summaryStr.length / 1024);
+  const detailsKB = Math.round(detailsStr.length / 1024);
+
+  return {
+    summaryKB,
+    detailsKB,
+    totalKB: summaryKB + detailsKB,
+  };
+}
+
+/**
+ * Check if this is a "large model" that needs special handling
+ */
+export function isLargeModel(models: FederatedModel[]): boolean {
+  let totalElements = 0;
+  for (const model of models) {
+    if (model.ifcDataStore.entities) {
+      totalElements += model.ifcDataStore.entities.count;
+    }
+  }
+  return totalElements > LARGE_MODEL_THRESHOLD;
+}
+
+/**
+ * Get model statistics for logging/debugging
+ */
+export function getModelStats(models: FederatedModel[]): {
+  totalElements: number;
+  totalModels: number;
+  isLarge: boolean;
+} {
+  let totalElements = 0;
+  for (const model of models) {
+    if (model.ifcDataStore.entities) {
+      totalElements += model.ifcDataStore.entities.count;
+    }
+  }
+
+  return {
+    totalElements,
+    totalModels: models.length,
+    isLarge: totalElements > LARGE_MODEL_THRESHOLD,
+  };
 }

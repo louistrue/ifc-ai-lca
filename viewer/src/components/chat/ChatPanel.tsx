@@ -18,7 +18,7 @@ import { Button } from '../ui/button';
 import { Send, Bot, User, Loader2, AlertCircle, Copy, Check, Wand2, Leaf, Search, BarChart3 } from 'lucide-react';
 import { EPDProposalsList } from './EPDProposalCard';
 import type { EPDProposal } from '../../store/slices/lcaSlice';
-import { buildModelSummary, getElementsForMaterial, type ModelSummary, type ElementDetail } from '../../lib/model-context';
+import { buildModelSummary, getElementsForMaterial, estimatePayloadSize, type ModelSummary, type ElementDetail } from '../../lib/model-context';
 
 /** EPD Agent API endpoint */
 const AGENT_API_ENDPOINT = import.meta.env.DEV
@@ -229,7 +229,9 @@ export function ChatPanel() {
   }, [chatMessages]);
 
   // Build rich model context with full material/element details
-  // Memoized to avoid rebuilding on every render
+  // OPTIMIZED for large models:
+  // - Only pre-fetch element details for TOP IMPACT materials (by GWP)
+  // - Limits payload size while giving agent the most useful data
   const modelContext = useMemo((): { summary: ModelSummary; elementDetails: Record<string, ElementDetail[]> } | null => {
     if (!lcaResults || extractedMaterials.length === 0) return null;
 
@@ -239,14 +241,32 @@ export function ChatPanel() {
     // Build the model summary with full context
     const summary = buildModelSummary(models, extractedMaterials, lcaResults);
 
-    // Pre-fetch element details for each material (limited to 20 per material)
+    // OPTIMIZATION: Only pre-fetch element details for TOP 5 materials by GWP contribution
+    // This keeps payload small while giving agent the most important data
+    const materialsWithGwp = summary.materials
+      .filter(m => m.currentEpd?.calculatedGwp)
+      .sort((a, b) => (b.currentEpd?.calculatedGwp || 0) - (a.currentEpd?.calculatedGwp || 0));
+
+    const topMaterialIds = new Set(materialsWithGwp.slice(0, 5).map(m => m.id));
+
+    // Also include any materials WITHOUT EPD matches (they need attention)
+    const unmatchedMaterials = summary.materials.filter(m => !m.currentEpd);
+    unmatchedMaterials.slice(0, 3).forEach(m => topMaterialIds.add(m.id));
+
+    // Pre-fetch element details only for priority materials (limited to 10 per material)
     const elementDetails: Record<string, ElementDetail[]> = {};
-    for (const material of extractedMaterials) {
-      const details = getElementsForMaterial(models, material.id, extractedMaterials, undefined, 20);
+    for (const materialId of topMaterialIds) {
+      const details = getElementsForMaterial(models, materialId, extractedMaterials, undefined, 10);
       if (details.length > 0) {
-        elementDetails[material.id] = details;
+        elementDetails[materialId] = details;
       }
     }
+
+    // Log payload size for debugging
+    const payloadSize = estimatePayloadSize(summary, elementDetails);
+    console.log(`[EPD Agent] Model context: ${summary.materials.length} materials, ${summary.project.elementCount.toLocaleString()} elements`);
+    console.log(`[EPD Agent] Payload size: ${payloadSize.summaryKB}KB summary + ${payloadSize.detailsKB}KB details = ${payloadSize.totalKB}KB total`);
+    console.log(`[EPD Agent] Details for ${topMaterialIds.size} priority materials (top ${materialsWithGwp.length > 5 ? 5 : materialsWithGwp.length} by GWP + ${unmatchedMaterials.length > 3 ? 3 : unmatchedMaterials.length} unmatched)`);
 
     return { summary, elementDetails };
   }, [lcaResults, extractedMaterials, getAllVisibleModels]);
