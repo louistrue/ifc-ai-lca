@@ -15,6 +15,10 @@ import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { useViewerStore } from '@/store';
 import { EntityContextMenu } from './EntityContextMenu';
 import { HoverTooltip } from './HoverTooltip';
+import { LCAPanel } from '../lca/LCAPanel';
+import { ChatPanel } from '../chat/ChatPanel';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Leaf, MessageSquare, Info } from 'lucide-react';
 
 export function ViewerLayout() {
   // Initialize keyboard shortcuts
@@ -98,7 +102,7 @@ export function ViewerLayout() {
 
             <PanelResizeHandle className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize" />
 
-            {/* Right Panel - Properties */}
+            {/* Right Panel - Properties/LCA/Chat */}
             <Panel
               id="right-panel"
               defaultSize={22}
@@ -106,8 +110,32 @@ export function ViewerLayout() {
               collapsible
               collapsedSize={0}
             >
-              <div className="h-full w-full overflow-hidden">
-                <PropertiesPanel />
+              <div className="h-full w-full overflow-hidden flex flex-col">
+                <Tabs defaultValue="lca" className="h-full flex flex-col">
+                  <TabsList className="mx-2 mt-2 grid grid-cols-3 h-9">
+                    <TabsTrigger value="lca" className="text-xs gap-1">
+                      <Leaf className="w-3 h-3" />
+                      LCA
+                    </TabsTrigger>
+                    <TabsTrigger value="chat" className="text-xs gap-1">
+                      <MessageSquare className="w-3 h-3" />
+                      Chat
+                    </TabsTrigger>
+                    <TabsTrigger value="properties" className="text-xs gap-1">
+                      <Info className="w-3 h-3" />
+                      Props
+                    </TabsTrigger>
+                  </TabsList>
+                  <TabsContent value="lca" className="flex-1 min-h-0 m-0">
+                    <LCAPanel />
+                  </TabsContent>
+                  <TabsContent value="chat" className="flex-1 min-h-0 m-0">
+                    <ChatPanel />
+                  </TabsContent>
+                  <TabsContent value="properties" className="flex-1 min-h-0 m-0">
+                    <PropertiesPanel />
+                  </TabsContent>
+                </Tabs>
               </div>
             </Panel>
           </PanelGroup>
