@@ -53,9 +53,10 @@ export default async function handler(req: Request) {
   }
 
   try {
-    const { messages, context } = await req.json() as {
+    const { messages, context, stream = true } = await req.json() as {
       messages: { role: 'user' | 'assistant'; content: string }[];
       context: LCAContext | null;
+      stream?: boolean;
     };
 
     const apiKey = process.env.OPENAI_API_KEY;
@@ -97,7 +98,7 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
       ...messages,
     ];
 
-    // Use direct OpenAI API with streaming for reliability
+    // Use direct OpenAI API (streaming or non-streaming based on request)
     const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -107,7 +108,7 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         messages: allMessages,
-        stream: true,
+        stream: stream,
       }),
     });
 
@@ -120,7 +121,19 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
       );
     }
 
-    // Transform OpenAI stream to Vercel AI SDK format
+    // Non-streaming response
+    if (!stream) {
+      const data = await openaiResponse.json() as {
+        choices: Array<{ message: { content: string } }>;
+      };
+      const content = data.choices?.[0]?.message?.content || '';
+      return new Response(
+        JSON.stringify({ content }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Streaming response - Transform OpenAI stream to Vercel AI SDK format
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
@@ -139,7 +152,6 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
               const parsed = JSON.parse(data);
               const content = parsed.choices?.[0]?.delta?.content;
               if (content) {
-                // Format as Vercel AI SDK stream format
                 controller.enqueue(encoder.encode(`0:${JSON.stringify(content)}\n`));
               }
             } catch {

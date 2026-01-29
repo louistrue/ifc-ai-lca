@@ -30,11 +30,12 @@ Key behaviors:
 You will receive context about the building's materials, their quantities, matched EPDs,
 and calculated environmental impacts. Use this context to provide accurate, specific advice.`;
 
-// Chat endpoint - uses direct OpenAI API with streaming
+// Chat endpoint - uses direct OpenAI API (streaming or non-streaming)
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages, context } = req.body as {
+    const { messages, context, stream = true } = req.body as {
       messages: { role: 'user' | 'assistant'; content: string }[];
+      stream?: boolean;
       context: {
         totalGWP?: number;
         matchedCount?: number;
@@ -90,7 +91,7 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
       ...messages,
     ];
 
-    // Use direct OpenAI API with streaming
+    // Use direct OpenAI API (streaming or non-streaming based on request)
     const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -100,7 +101,7 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         messages: allMessages,
-        stream: true,
+        stream: stream,
       }),
     });
 
@@ -111,12 +112,21 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
       return;
     }
 
-    // Set headers for streaming
+    // Non-streaming response
+    if (!stream) {
+      const data = await openaiResponse.json() as {
+        choices: Array<{ message: { content: string } }>;
+      };
+      const content = data.choices?.[0]?.message?.content || '';
+      res.json({ content });
+      return;
+    }
+
+    // Streaming response
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // Stream and transform chunks to client
     const reader = openaiResponse.body?.getReader();
     if (!reader) {
       res.status(500).json({ error: 'No response body from OpenAI' });
@@ -147,7 +157,6 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
                 const parsed = JSON.parse(data);
                 const content = parsed.choices?.[0]?.delta?.content;
                 if (content) {
-                  // Format as Vercel AI SDK stream format
                   res.write(`0:${JSON.stringify(content)}\n`);
                 }
               } catch {
