@@ -9,7 +9,7 @@ import { extractMaterialsFromIFC } from '../../store/slices/lcaSlice';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs';
 import { ScrollArea } from '../ui/scroll-area';
 import { Badge } from '../ui/badge';
-import { Leaf, AlertTriangle, CheckCircle, ArrowRight, Loader2 } from 'lucide-react';
+import { Leaf, AlertTriangle, CheckCircle, ArrowRight, Loader2, Sparkles, Cpu } from 'lucide-react';
 import type { EPDMatch, ExtractedMaterial, MaterialCategory } from '../../lib/epd/types';
 
 const categoryColors: Record<MaterialCategory, string> = {
@@ -100,10 +100,22 @@ function MaterialCard({
 
       {match && isSelected && (
         <div className="mt-3 pt-3 border-t border-border/50">
-          <div className="text-xs text-muted-foreground mb-1">Matched EPD:</div>
+          <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+            <span>Matched EPD:</span>
+            {match.matchReason.startsWith('LLM:') && (
+              <Badge variant="secondary" className="text-[10px] px-1 py-0 h-4">
+                <Sparkles className="w-2.5 h-2.5 mr-0.5" />
+                AI
+              </Badge>
+            )}
+          </div>
           <div className="text-sm font-medium">{match.epd.name}</div>
           <div className="text-xs text-muted-foreground">{match.epd.manufacturer}</div>
-          <div className="text-xs text-muted-foreground mt-1">{match.matchReason}</div>
+          <div className="text-xs text-muted-foreground mt-1">
+            {match.matchReason.startsWith('LLM:')
+              ? match.matchReason.replace('LLM: ', '')
+              : match.matchReason}
+          </div>
 
           {match.alternatives && match.alternatives.length > 0 && (
             <div className="mt-2">
@@ -187,8 +199,10 @@ export function LCAPanel() {
   const extractedMaterials = useViewerStore((s) => s.extractedMaterials);
   const lcaResults = useViewerStore((s) => s.lcaResults);
   const selectedMaterialId = useViewerStore((s) => s.selectedMaterialId);
+  const isMatchingInProgress = useViewerStore((s) => s.isMatchingInProgress);
+  const matchingMethod = useViewerStore((s) => s.matchingMethod);
   const setExtractedMaterials = useViewerStore((s) => s.setExtractedMaterials);
-  const runEPDMatching = useViewerStore((s) => s.runEPDMatching);
+  const runLLMEPDMatching = useViewerStore((s) => s.runLLMEPDMatching);
   const selectMaterial = useViewerStore((s) => s.selectMaterial);
   const setSelectedEntityIds = useViewerStore((s) => s.setSelectedEntityIds);
 
@@ -200,12 +214,12 @@ export function LCAPanel() {
     }
   }, [ifcDataStore, geometryResult, setExtractedMaterials]);
 
-  // Run EPD matching when materials are extracted
+  // Run LLM EPD matching when materials are extracted (uses LLM with fallback)
   useEffect(() => {
-    if (extractedMaterials.length > 0 && !lcaResults) {
-      runEPDMatching();
+    if (extractedMaterials.length > 0 && !lcaResults && !isMatchingInProgress) {
+      runLLMEPDMatching();
     }
-  }, [extractedMaterials, lcaResults, runEPDMatching]);
+  }, [extractedMaterials, lcaResults, isMatchingInProgress, runLLMEPDMatching]);
 
   // Highlight elements when material is selected
   const handleSelectMaterial = (materialId: string) => {
@@ -242,12 +256,41 @@ export function LCAPanel() {
     );
   }
 
+  if (isMatchingInProgress) {
+    return (
+      <div className="h-full flex items-center justify-center text-muted-foreground text-sm">
+        <div className="text-center">
+          <Sparkles className="w-6 h-6 animate-pulse mx-auto mb-2 text-primary" />
+          <p>AI-powered EPD matching...</p>
+          <p className="text-xs mt-1 opacity-70">Using GPT-4o-mini for intelligent material matching</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <Tabs defaultValue="materials" className="h-full flex flex-col">
       <TabsList className="mx-2 mt-2 grid grid-cols-2">
         <TabsTrigger value="materials">Materials</TabsTrigger>
         <TabsTrigger value="summary">Summary</TabsTrigger>
       </TabsList>
+
+      {/* Matching method indicator */}
+      {matchingMethod !== 'none' && (
+        <div className="mx-2 mt-2 flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
+          {matchingMethod === 'llm' ? (
+            <>
+              <Sparkles className="w-3 h-3 text-primary" />
+              <span>AI-matched (GPT-4o-mini)</span>
+            </>
+          ) : (
+            <>
+              <Cpu className="w-3 h-3" />
+              <span>Algorithmic matching</span>
+            </>
+          )}
+        </div>
+      )}
 
       <TabsContent value="materials" className="flex-1 min-h-0 m-0">
         <ScrollArea className="h-full">

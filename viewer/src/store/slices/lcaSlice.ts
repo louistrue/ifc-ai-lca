@@ -6,6 +6,7 @@
 import type { StateCreator } from 'zustand';
 import type { ExtractedMaterial, EPDMatch, LCAResults, MaterialCategory } from '../../lib/epd/types';
 import { matchAllMaterials, detectCategory, findBestMatch } from '../../lib/epd/matcher';
+import { matchAllMaterialsWithLLM, checkLLMAvailability } from '../../lib/epd/llm-matcher';
 
 export interface LCASlice {
   // Extracted materials from IFC
@@ -17,12 +18,17 @@ export interface LCASlice {
   // UI State
   selectedMaterialId: string | null;
   highlightedMaterialElements: number[];
+  isMatchingInProgress: boolean;
+  matchingMethod: 'none' | 'algorithmic' | 'llm';
+  llmAvailable: boolean;
 
   // Actions
   setExtractedMaterials: (materials: ExtractedMaterial[]) => void;
   runEPDMatching: () => void;
+  runLLMEPDMatching: () => Promise<void>;
   selectMaterial: (materialId: string | null) => void;
   clearLCAResults: () => void;
+  checkLLMStatus: () => Promise<void>;
 
   // Helpers
   getMaterialById: (id: string) => ExtractedMaterial | undefined;
@@ -35,6 +41,9 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
   lcaResults: null,
   selectedMaterialId: null,
   highlightedMaterialElements: [],
+  isMatchingInProgress: false,
+  matchingMethod: 'none',
+  llmAvailable: false,
 
   // Actions
   setExtractedMaterials: (materials) => {
@@ -47,8 +56,35 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
       return;
     }
 
+    set({ isMatchingInProgress: true });
     const results = matchAllMaterials(extractedMaterials);
-    set({ lcaResults: results });
+    set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: 'algorithmic' });
+  },
+
+  runLLMEPDMatching: async () => {
+    const { extractedMaterials } = get();
+    if (extractedMaterials.length === 0) {
+      return;
+    }
+
+    set({ isMatchingInProgress: true, matchingMethod: 'none' });
+
+    try {
+      console.log('[LCA] Running LLM-based EPD matching...');
+      const results = await matchAllMaterialsWithLLM(extractedMaterials, true);
+
+      // Determine which method was actually used
+      const usedLLM = results.matches.some(m => m.matchReason.startsWith('LLM:'));
+      const method = usedLLM ? 'llm' : 'algorithmic';
+
+      console.log(`[LCA] Matching complete using ${method} method`);
+      set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: method });
+    } catch (error) {
+      console.error('[LCA] LLM matching failed:', error);
+      // Fall back to algorithmic
+      const results = matchAllMaterials(extractedMaterials);
+      set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: 'algorithmic' });
+    }
   },
 
   selectMaterial: (materialId) => {
@@ -67,7 +103,14 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
       lcaResults: null,
       selectedMaterialId: null,
       highlightedMaterialElements: [],
+      matchingMethod: 'none',
     });
+  },
+
+  checkLLMStatus: async () => {
+    const available = await checkLLMAvailability();
+    set({ llmAvailable: available });
+    console.log(`[LCA] LLM availability: ${available}`);
   },
 
   // Helpers
