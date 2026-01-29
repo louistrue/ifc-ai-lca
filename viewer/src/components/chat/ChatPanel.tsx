@@ -1,13 +1,14 @@
 /**
  * AI Chat Panel Component
- * Chat interface for LCA analysis using non-streaming API for reliability
+ * Chat interface for LCA analysis with markdown rendering and copy support
  */
 
-import React, { useRef, useEffect, useState, FormEvent } from 'react';
+import React, { useRef, useEffect, useState, FormEvent, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { useViewerStore } from '../../store';
 import { ScrollArea } from '../ui/scroll-area';
 import { Button } from '../ui/button';
-import { Send, Bot, User, Loader2, Sparkles, AlertCircle, Leaf, BarChart3, Lightbulb } from 'lucide-react';
+import { Send, Bot, User, Loader2, Sparkles, AlertCircle, Leaf, BarChart3, Lightbulb, Copy, Check } from 'lucide-react';
 
 /** API endpoint for chat - use Express server in dev, Vercel in production */
 const CHAT_API_ENDPOINT = import.meta.env.DEV
@@ -26,11 +27,40 @@ const suggestedPrompts = [
   { icon: Leaf, text: 'Explain the total GWP calculation' },
 ];
 
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  }, [text]);
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="p-1 rounded hover:bg-background/50 transition-colors opacity-0 group-hover:opacity-100"
+      title="Copy message"
+    >
+      {copied ? (
+        <Check className="w-3.5 h-3.5 text-green-500" />
+      ) : (
+        <Copy className="w-3.5 h-3.5 text-muted-foreground" />
+      )}
+    </button>
+  );
+}
+
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user';
 
   return (
-    <div className={`flex gap-2 ${isUser ? 'flex-row-reverse' : ''}`}>
+    <div className={`flex gap-2 group ${isUser ? 'flex-row-reverse' : ''}`}>
       <div
         className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 ${
           isUser ? 'bg-primary text-primary-foreground' : 'bg-muted'
@@ -39,11 +69,79 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
       </div>
       <div
-        className={`flex-1 rounded-lg px-3 py-2 text-sm ${
+        className={`flex-1 rounded-lg px-3 py-2 text-sm relative ${
           isUser ? 'bg-primary text-primary-foreground' : 'bg-muted'
         }`}
       >
-        <div className="whitespace-pre-wrap">{message.content}</div>
+        {/* Copy button */}
+        <div className={`absolute top-1 ${isUser ? 'left-1' : 'right-1'}`}>
+          <CopyButton text={message.content} />
+        </div>
+
+        {/* Message content with markdown */}
+        {isUser ? (
+          <div className="whitespace-pre-wrap pr-6">{message.content}</div>
+        ) : (
+          <div className="prose prose-sm dark:prose-invert max-w-none pr-6 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+            <ReactMarkdown
+              components={{
+                // Style headings
+                h1: ({ children }) => <h3 className="text-base font-bold mt-3 mb-2">{children}</h3>,
+                h2: ({ children }) => <h4 className="text-sm font-bold mt-3 mb-1.5">{children}</h4>,
+                h3: ({ children }) => <h5 className="text-sm font-semibold mt-2 mb-1">{children}</h5>,
+                // Style paragraphs
+                p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+                // Style lists
+                ul: ({ children }) => <ul className="list-disc list-inside mb-2 space-y-1">{children}</ul>,
+                ol: ({ children }) => <ol className="list-decimal list-inside mb-2 space-y-1">{children}</ol>,
+                li: ({ children }) => <li className="text-sm">{children}</li>,
+                // Style bold/italic
+                strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
+                em: ({ children }) => <em className="italic">{children}</em>,
+                // Style code
+                code: ({ children, className }) => {
+                  const isBlock = className?.includes('language-');
+                  if (isBlock) {
+                    return (
+                      <code className="block bg-background/50 rounded p-2 text-xs overflow-x-auto my-2">
+                        {children}
+                      </code>
+                    );
+                  }
+                  return (
+                    <code className="bg-background/50 rounded px-1 py-0.5 text-xs font-mono">
+                      {children}
+                    </code>
+                  );
+                },
+                // Style blockquotes
+                blockquote: ({ children }) => (
+                  <blockquote className="border-l-2 border-primary/50 pl-3 italic my-2">
+                    {children}
+                  </blockquote>
+                ),
+                // Style tables
+                table: ({ children }) => (
+                  <div className="overflow-x-auto my-2">
+                    <table className="min-w-full text-xs border-collapse">{children}</table>
+                  </div>
+                ),
+                th: ({ children }) => (
+                  <th className="border border-border px-2 py-1 bg-muted/50 font-semibold text-left">
+                    {children}
+                  </th>
+                ),
+                td: ({ children }) => (
+                  <td className="border border-border px-2 py-1">{children}</td>
+                ),
+                // Style horizontal rules
+                hr: () => <hr className="my-3 border-border" />,
+              }}
+            >
+              {message.content}
+            </ReactMarkdown>
+          </div>
+        )}
       </div>
     </div>
   );
