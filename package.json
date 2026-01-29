@@ -1,0 +1,14 @@
+{
+  "name": "ifc-ai-lca",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "cd viewer && npm run dev",
+    "build": "cd viewer && npm run build",
+    "install:all": "npm install && cd viewer && npm install"
+  },
+  "dependencies": {
+    "ai": "^6.0.59",
+    "@ai-sdk/openai": "^3.0.21"
+  }
+}
