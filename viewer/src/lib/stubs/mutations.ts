@@ -18,6 +18,7 @@ export class MutationEngine {
 export class MutablePropertyView {
   constructor(_store: unknown) {}
   getProperties(_entityId: number) { return []; }
+  getForEntity(_entityId: number) { return []; }
   setProperty(_entityId: number, _psetName: string, _propName: string, _value: unknown) {}
   addPropertySet(_entityId: number, _psetName: string) {}
   removePropertySet(_entityId: number, _psetName: string) {}
