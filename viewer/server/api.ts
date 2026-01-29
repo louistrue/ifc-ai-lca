@@ -598,6 +598,384 @@ app.get('/api/oekobaudat/:uuid', async (req, res) => {
   }
 });
 
+// ============ EPD Agent Endpoint ============
+
+interface AgentMaterialInfo {
+  id: string;
+  name: string;
+  category: string;
+  elementIds: number[];
+  totalVolume?: number;
+  totalArea?: number;
+  properties?: Record<string, unknown>;
+}
+
+interface AgentCurrentMatch {
+  epdId: string;
+  epdName: string;
+  confidence: number;
+  gwp: number;
+  calculatedGWP: number;
+}
+
+interface AgentEPDProposal {
+  id: string;
+  material_id: string;
+  material_name: string;
+  current_epd_id?: string;
+  current_epd_name?: string;
+  current_gwp?: number;
+  proposed_epd_id: string;
+  proposed_epd_name: string;
+  proposed_gwp: number;
+  gwp_difference: number;
+  gwp_difference_percent: number;
+  confidence: number;
+  reasoning: string;
+  key_benefits: string[];
+  status: 'pending' | 'accepted' | 'rejected';
+}
+
+// Mock EPD database for agent (subset)
+const agentMockEPDs: Record<string, {
+  id: string;
+  name: string;
+  category: string;
+  gwp: number;
+  unit: string;
+  fire_rating?: string;
+  recycled_content?: number;
+  use_cases: string[];
+  suitable_for: string[];
+}> = {
+  'mock-concrete-001': { id: 'mock-concrete-001', name: 'Ready-Mix Concrete C30/37', category: 'CONCRETE', gwp: 285, unit: 'm3', fire_rating: 'REI 120', recycled_content: 5, use_cases: ['structural'], suitable_for: ['wall', 'slab', 'column'] },
+  'mock-concrete-002': { id: 'mock-concrete-002', name: 'Low-Carbon Concrete C30/37 (CEM III)', category: 'CONCRETE', gwp: 165, unit: 'm3', fire_rating: 'REI 120', recycled_content: 35, use_cases: ['structural', 'sustainable'], suitable_for: ['wall', 'slab', 'column'] },
+  'mock-concrete-003': { id: 'mock-concrete-003', name: 'High-Strength Concrete C50/60', category: 'CONCRETE', gwp: 380, unit: 'm3', fire_rating: 'REI 120', recycled_content: 3, use_cases: ['structural', 'high-rise'], suitable_for: ['column', 'beam'] },
+  'mock-steel-001': { id: 'mock-steel-001', name: 'Structural Steel S355', category: 'STEEL', gwp: 1.85, unit: 'kg', recycled_content: 25, use_cases: ['structural'], suitable_for: ['beam', 'column'] },
+  'mock-steel-002': { id: 'mock-steel-002', name: 'Recycled Steel S355 (EAF)', category: 'STEEL', gwp: 0.65, unit: 'kg', recycled_content: 95, use_cases: ['structural', 'sustainable'], suitable_for: ['beam', 'column'] },
+  'mock-wood-001': { id: 'mock-wood-001', name: 'Cross-Laminated Timber (CLT)', category: 'WOOD', gwp: -680, unit: 'm3', fire_rating: 'REI 60', use_cases: ['structural', 'sustainable'], suitable_for: ['wall', 'slab', 'roof'] },
+  'mock-wood-002': { id: 'mock-wood-002', name: 'Glulam Beam GL24h', category: 'WOOD', gwp: -720, unit: 'm3', fire_rating: 'R 60', use_cases: ['structural'], suitable_for: ['beam', 'column'] },
+  'mock-insulation-001': { id: 'mock-insulation-001', name: 'Mineral Wool (Stone Wool)', category: 'INSULATION', gwp: 1.12, unit: 'kg', fire_rating: 'A1', recycled_content: 25, use_cases: ['thermal-insulation', 'fire-protection'], suitable_for: ['wall', 'roof'] },
+  'mock-insulation-003': { id: 'mock-insulation-003', name: 'Wood Fiber Insulation', category: 'INSULATION', gwp: -0.85, unit: 'kg', use_cases: ['thermal-insulation', 'sustainable'], suitable_for: ['wall', 'roof'] },
+  'mock-glass-001': { id: 'mock-glass-001', name: 'Triple Glazing Unit (Argon)', category: 'GLASS', gwp: 32, unit: 'm2', recycled_content: 20, use_cases: ['glazing', 'energy-efficient'], suitable_for: ['window', 'facade'] },
+  'mock-gypsum-001': { id: 'mock-gypsum-001', name: 'Gypsum Board (Standard)', category: 'GYPSUM', gwp: 2.8, unit: 'm2', fire_rating: 'EI 30', recycled_content: 25, use_cases: ['interior', 'partition'], suitable_for: ['wall', 'ceiling'] },
+  'mock-aluminum-002': { id: 'mock-aluminum-002', name: 'Recycled Aluminum Profile', category: 'ALUMINUM', gwp: 2.1, unit: 'kg', recycled_content: 75, use_cases: ['facade', 'sustainable'], suitable_for: ['window', 'facade'] },
+};
+
+// Agent tool definitions
+const agentToolDefinitions = [
+  {
+    type: 'function',
+    function: {
+      name: 'query_building_elements',
+      description: 'Query building elements from the loaded IFC model. Returns a summary of elements grouped by type and material.',
+      parameters: {
+        type: 'object',
+        properties: {
+          element_type: { type: 'string', enum: ['wall', 'slab', 'column', 'beam', 'window', 'door', 'roof', 'stair', 'railing', 'all'] },
+          include_properties: { type: 'boolean' },
+        },
+        required: ['element_type'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_epd_database',
+      description: 'Search the EPD database with specific criteria. Returns matching EPDs sorted by relevance.',
+      parameters: {
+        type: 'object',
+        properties: {
+          category: { type: 'string', enum: ['CONCRETE', 'STEEL', 'WOOD', 'GLASS', 'INSULATION', 'MASONRY', 'ALUMINUM', 'GYPSUM', 'PLASTIC', 'MEMBRANE'] },
+          gwp_max: { type: 'number' },
+          use_case: { type: 'string', enum: ['structural', 'facade', 'interior', 'foundation', 'thermal-insulation', 'fire-protection', 'sustainable'] },
+          suitable_for: { type: 'string', enum: ['wall', 'slab', 'column', 'beam', 'roof', 'window', 'facade', 'ceiling'] },
+          recycled_content_min: { type: 'number' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_epd_details',
+      description: 'Get full details for a specific EPD.',
+      parameters: {
+        type: 'object',
+        properties: { epd_id: { type: 'string' } },
+        required: ['epd_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'propose_epd_mapping',
+      description: 'Propose a new EPD mapping for a material.',
+      parameters: {
+        type: 'object',
+        properties: {
+          material_id: { type: 'string' },
+          proposed_epd_id: { type: 'string' },
+          confidence: { type: 'number', minimum: 0, maximum: 100 },
+          reasoning: { type: 'string' },
+          key_benefits: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['material_id', 'proposed_epd_id', 'confidence', 'reasoning'],
+      },
+    },
+  },
+];
+
+// Agent tool handlers
+function handleAgentQueryElements(materials: AgentMaterialInfo[], matches: Record<string, AgentCurrentMatch>): string {
+  if (materials.length === 0) return 'No materials extracted from IFC model.';
+
+  let output = '=== Building Materials ===\n\n';
+  const byCategory: Record<string, AgentMaterialInfo[]> = {};
+  materials.forEach(m => {
+    const cat = m.category || 'OTHER';
+    if (!byCategory[cat]) byCategory[cat] = [];
+    byCategory[cat].push(m);
+  });
+
+  for (const [category, mats] of Object.entries(byCategory)) {
+    output += `📦 ${category}:\n`;
+    for (const mat of mats) {
+      const match = matches[mat.id];
+      output += `  • ${mat.name} (${mat.id})\n`;
+      output += `    Elements: ${mat.elementIds.length}`;
+      if (mat.totalVolume) output += ` | Volume: ${mat.totalVolume.toFixed(2)} m³`;
+      output += '\n';
+      if (match) {
+        output += `    Current EPD: ${match.epdName} (${match.confidence}% conf)\n`;
+        output += `    GWP: ${match.calculatedGWP.toFixed(0)} kg CO₂e\n`;
+      }
+    }
+    output += '\n';
+  }
+  return output;
+}
+
+function handleAgentSearchEPD(args: { category?: string; gwp_max?: number; use_case?: string; suitable_for?: string; recycled_content_min?: number }): string {
+  const results = Object.values(agentMockEPDs).filter(epd => {
+    if (args.category && epd.category !== args.category) return false;
+    if (args.gwp_max && epd.gwp > args.gwp_max) return false;
+    if (args.use_case && !epd.use_cases.includes(args.use_case)) return false;
+    if (args.suitable_for && !epd.suitable_for.includes(args.suitable_for)) return false;
+    if (args.recycled_content_min && (epd.recycled_content || 0) < args.recycled_content_min) return false;
+    return true;
+  }).sort((a, b) => a.gwp - b.gwp);
+
+  if (results.length === 0) return 'No EPDs found matching criteria.';
+
+  return results.map((epd, i) =>
+    `${i + 1}. [${epd.id}] ${epd.name}\n   GWP: ${epd.gwp} kg CO₂e/${epd.unit}${epd.fire_rating ? ` | Fire: ${epd.fire_rating}` : ''}${epd.recycled_content ? ` | Recycled: ${epd.recycled_content}%` : ''}`
+  ).join('\n\n');
+}
+
+function handleAgentProposal(
+  args: { material_id: string; proposed_epd_id: string; confidence: number; reasoning: string; key_benefits?: string[] },
+  materials: AgentMaterialInfo[],
+  matches: Record<string, AgentCurrentMatch>
+): { result: string; proposal?: AgentEPDProposal } {
+  const material = materials.find(m => m.id === args.material_id);
+  if (!material) return { result: `Material "${args.material_id}" not found.` };
+
+  const epd = agentMockEPDs[args.proposed_epd_id];
+  if (!epd) return { result: `EPD "${args.proposed_epd_id}" not found.` };
+
+  const currentMatch = matches[args.material_id];
+  const quantity = material.totalVolume || material.totalArea || 1;
+  const proposedGWP = epd.gwp * quantity;
+  const currentGWP = currentMatch?.calculatedGWP || 0;
+  const gwpDiff = proposedGWP - currentGWP;
+  const gwpDiffPercent = currentGWP > 0 ? (gwpDiff / currentGWP) * 100 : 0;
+
+  const proposal: AgentEPDProposal = {
+    id: `proposal-${Date.now()}`,
+    material_id: args.material_id,
+    material_name: material.name,
+    current_epd_id: currentMatch?.epdId,
+    current_epd_name: currentMatch?.epdName,
+    current_gwp: currentGWP,
+    proposed_epd_id: args.proposed_epd_id,
+    proposed_epd_name: epd.name,
+    proposed_gwp: proposedGWP,
+    gwp_difference: gwpDiff,
+    gwp_difference_percent: gwpDiffPercent,
+    confidence: args.confidence,
+    reasoning: args.reasoning,
+    key_benefits: args.key_benefits || [],
+    status: 'pending',
+  };
+
+  return {
+    result: `✅ Proposal created for "${material.name}"\nProposed: ${epd.name}\nGWP change: ${gwpDiff >= 0 ? '+' : ''}${gwpDiff.toFixed(0)} kg CO₂e (${gwpDiffPercent >= 0 ? '+' : ''}${gwpDiffPercent.toFixed(1)}%)`,
+    proposal,
+  };
+}
+
+// EPD Agent endpoint
+app.post('/api/epd-agent', async (req, res) => {
+  try {
+    const { message, materials, currentMatches, conversationHistory = [] } = req.body as {
+      message: string;
+      materials: AgentMaterialInfo[];
+      currentMatches: Record<string, AgentCurrentMatch>;
+      conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    };
+
+    if (!process.env.OPENAI_API_KEY) {
+      res.status(401).json({ error: 'API key not configured' });
+      return;
+    }
+
+    // Build context summary
+    let contextSummary = '';
+    if (materials && materials.length > 0) {
+      contextSummary = `\n\nCurrent building has ${materials.length} materials:\n`;
+      contextSummary += materials.map(m =>
+        `- ${m.name} (${m.category}): ${m.elementIds.length} elements${m.totalVolume ? `, ${m.totalVolume.toFixed(1)} m³` : ''}`
+      ).join('\n');
+    }
+
+    const agentSystemPrompt = `You are an expert EPD (Environmental Product Declaration) matching agent for building Life Cycle Assessment.
+
+Your role is to help users find the most appropriate EPDs for their building materials by:
+1. Understanding the building's materials and their properties
+2. Searching the EPD database with specific technical criteria
+3. Comparing options and recommending the best matches
+4. Creating proposals for improved EPD mappings
+
+IMPORTANT GUIDELINES:
+- Always start by querying the building elements to understand what materials exist
+- Consider technical requirements like fire rating, strength class, etc.
+- Prioritize lower GWP options when they meet technical requirements
+- Explain your reasoning clearly when making proposals
+- Create proposals using propose_epd_mapping for each recommended change
+
+Be concise but thorough. Focus on actionable recommendations.`;
+
+    const messages: Array<{ role: string; content: string; tool_call_id?: string; tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }> }> = [
+      { role: 'system', content: agentSystemPrompt + contextSummary },
+      ...conversationHistory.map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: message },
+    ];
+
+    const proposals: AgentEPDProposal[] = [];
+    const toolResults: Array<{ tool: string; result: string }> = [];
+
+    // Agent loop - max 5 iterations
+    for (let i = 0; i < 5; i++) {
+      const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages,
+          tools: agentToolDefinitions,
+          tool_choice: 'auto',
+        }),
+      });
+
+      if (!openaiResponse.ok) {
+        const error = await openaiResponse.text();
+        console.error('[EPD Agent] OpenAI error:', error);
+        res.status(500).json({ error: 'OpenAI API error', details: error });
+        return;
+      }
+
+      const data = await openaiResponse.json() as {
+        choices: Array<{
+          message: {
+            role: string;
+            content: string | null;
+            tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>;
+          };
+          finish_reason: string;
+        }>;
+      };
+
+      const choice = data.choices[0];
+      const assistantMessage = choice.message;
+
+      messages.push(assistantMessage as typeof messages[0]);
+
+      // Execute tool calls if any
+      if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+        for (const toolCall of assistantMessage.tool_calls) {
+          const toolName = toolCall.function.name;
+          const toolArgs = JSON.parse(toolCall.function.arguments);
+
+          console.log(`[EPD Agent] Executing tool: ${toolName}`, toolArgs);
+
+          let result: string;
+          let proposal: AgentEPDProposal | undefined;
+
+          switch (toolName) {
+            case 'query_building_elements':
+              result = handleAgentQueryElements(materials, currentMatches);
+              break;
+            case 'search_epd_database':
+              result = handleAgentSearchEPD(toolArgs);
+              break;
+            case 'get_epd_details': {
+              const epd = agentMockEPDs[toolArgs.epd_id];
+              result = epd
+                ? `=== ${epd.name} ===\nID: ${epd.id}\nCategory: ${epd.category}\nGWP: ${epd.gwp} kg CO₂e/${epd.unit}\n${epd.fire_rating ? `Fire Rating: ${epd.fire_rating}\n` : ''}${epd.recycled_content ? `Recycled: ${epd.recycled_content}%\n` : ''}Use Cases: ${epd.use_cases.join(', ')}`
+                : 'EPD not found.';
+              break;
+            }
+            case 'propose_epd_mapping': {
+              const proposalResult = handleAgentProposal(toolArgs, materials, currentMatches);
+              result = proposalResult.result;
+              proposal = proposalResult.proposal;
+              break;
+            }
+            default:
+              result = `Unknown tool: ${toolName}`;
+          }
+
+          if (proposal) {
+            proposals.push(proposal);
+          }
+
+          toolResults.push({ tool: toolName, result });
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: result,
+          });
+        }
+      } else {
+        // No more tool calls - return final response
+        res.json({
+          response: assistantMessage.content,
+          proposals,
+          toolResults,
+        });
+        return;
+      }
+    }
+
+    // Max iterations reached
+    res.json({
+      response: 'I\'ve analyzed the building and created my recommendations. Please review the proposals above.',
+      proposals,
+      toolResults,
+    });
+  } catch (error) {
+    console.error('[EPD Agent] Error:', error);
+    res.status(500).json({ error: 'Internal server error', details: String(error) });
+  }
+});
+
 // Health check
 app.get('/api/health', (_, res) => {
   res.json({
@@ -610,6 +988,7 @@ app.get('/api/health', (_, res) => {
 app.listen(PORT, () => {
   console.log(`API server running on http://localhost:${PORT}`);
   console.log('✅ Ökobaudat API proxy enabled');
+  console.log('✅ EPD Agent endpoint enabled');
   if (!process.env.OPENAI_API_KEY) {
     console.warn('⚠️  OPENAI_API_KEY not set - chat will not work');
   }

@@ -4,12 +4,14 @@
  */
 
 import type { StateCreator } from 'zustand';
+import type { EPDProposal } from './lcaSlice';
 
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   timestamp: number;
+  proposals?: EPDProposal[]; // EPD proposals from agent
 }
 
 export interface ChatSlice {
@@ -20,7 +22,7 @@ export interface ChatSlice {
 
   // Actions
   addChatMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => string;
-  updateChatMessage: (id: string, content: string) => void;
+  updateChatMessage: (id: string, content: string, proposals?: EPDProposal[]) => void;
   setChatLoading: (loading: boolean) => void;
   setChatError: (error: string | null) => void;
   clearChat: () => void;
@@ -46,10 +48,10 @@ export const createChatSlice: StateCreator<ChatSlice, [], [], ChatSlice> = (set,
     return id;
   },
 
-  updateChatMessage: (id, content) => {
+  updateChatMessage: (id, content, proposals) => {
     set((state) => ({
       chatMessages: state.chatMessages.map((m) =>
-        m.id === id ? { ...m, content } : m
+        m.id === id ? { ...m, content, ...(proposals && { proposals }) } : m
       ),
     }));
   },

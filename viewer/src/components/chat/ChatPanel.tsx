@@ -1,6 +1,6 @@
 /**
  * AI Chat Panel Component
- * Chat interface for LCA analysis with markdown rendering and copy support
+ * Chat interface for LCA analysis with markdown rendering, copy support, and EPD agent
  */
 
 import React, { useRef, useEffect, useState, FormEvent, useCallback } from 'react';
@@ -8,23 +8,36 @@ import ReactMarkdown from 'react-markdown';
 import { useViewerStore } from '../../store';
 import { ScrollArea } from '../ui/scroll-area';
 import { Button } from '../ui/button';
-import { Send, Bot, User, Loader2, Sparkles, AlertCircle, Leaf, BarChart3, Lightbulb, Copy, Check } from 'lucide-react';
+import { Send, Bot, User, Loader2, Sparkles, AlertCircle, Leaf, BarChart3, Lightbulb, Copy, Check, Wand2, RefreshCw } from 'lucide-react';
+import { EPDProposalsList } from './EPDProposalCard';
+import type { EPDProposal } from '../../store/slices/lcaSlice';
 
-/** API endpoint for chat - use Express server in dev, Vercel in production */
+/** API endpoints */
 const CHAT_API_ENDPOINT = import.meta.env.DEV
   ? 'http://localhost:3001/api/chat'
   : '/api/chat';
+
+const AGENT_API_ENDPOINT = import.meta.env.DEV
+  ? 'http://localhost:3001/api/epd-agent'
+  : '/api/epd-agent';
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  proposals?: EPDProposal[]; // Embedded EPD proposals from agent
 }
 
 const suggestedPrompts = [
   { icon: BarChart3, text: 'Which material has the highest impact?' },
   { icon: Lightbulb, text: 'Suggest lower-carbon alternatives' },
   { icon: Leaf, text: 'Explain the total GWP calculation' },
+];
+
+const agentPrompts = [
+  { icon: Wand2, text: 'Find better EPDs for all materials' },
+  { icon: RefreshCw, text: 'Find lower-carbon concrete alternatives' },
+  { icon: Leaf, text: 'Suggest EPDs with recycled content' },
 ];
 
 function CopyButton({ text }: { text: string }) {
@@ -56,17 +69,24 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+interface MessageBubbleProps {
+  message: ChatMessage;
+  onAcceptProposal?: (id: string) => void;
+  onRejectProposal?: (id: string) => void;
+}
+
+function MessageBubble({ message, onAcceptProposal, onRejectProposal }: MessageBubbleProps) {
   const isUser = message.role === 'user';
+  const hasProposals = message.proposals && message.proposals.length > 0;
 
   return (
     <div className={`flex gap-2 group ${isUser ? 'flex-row-reverse' : ''}`}>
       <div
         className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 ${
-          isUser ? 'bg-primary text-primary-foreground' : 'bg-muted'
+          isUser ? 'bg-primary text-primary-foreground' : hasProposals ? 'bg-gradient-to-br from-primary to-purple-500 text-white' : 'bg-muted'
         }`}
       >
-        {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+        {isUser ? <User className="w-4 h-4" /> : hasProposals ? <Wand2 className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
       </div>
       <div
         className={`flex-1 rounded-lg px-3 py-2 text-sm relative ${
@@ -147,6 +167,32 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   );
 }
 
+/**
+ * Separate component to render proposals after a message
+ * This keeps proposals visually connected but semantically separate
+ */
+function MessageProposals({
+  proposals,
+  onAccept,
+  onReject
+}: {
+  proposals: EPDProposal[];
+  onAccept: (id: string) => void;
+  onReject: (id: string) => void;
+}) {
+  if (!proposals || proposals.length === 0) return null;
+
+  return (
+    <div className="ml-9 mt-2">
+      <EPDProposalsList
+        proposals={proposals}
+        onAccept={onAccept}
+        onReject={onReject}
+      />
+    </div>
+  );
+}
+
 export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -160,12 +206,22 @@ export function ChatPanel() {
   const setChatLoading = useViewerStore((s) => s.setChatLoading);
   const setChatError = useViewerStore((s) => s.setChatError);
 
-  // Local state just for the input field
+  // EPD Agent state
+  const epdProposals = useViewerStore((s) => s.epdProposals);
+  const isAgentProcessing = useViewerStore((s) => s.isAgentProcessing);
+  const addEPDProposals = useViewerStore((s) => s.addEPDProposals);
+  const acceptProposal = useViewerStore((s) => s.acceptProposal);
+  const rejectProposal = useViewerStore((s) => s.rejectProposal);
+  const setAgentProcessing = useViewerStore((s) => s.setAgentProcessing);
+
+  // Local state
   const [input, setInput] = useState('');
+  const [isAgentMode, setIsAgentMode] = useState(false);
 
   // Get LCA context from store
   const lcaResults = useViewerStore((s) => s.lcaResults);
   const matchingMethod = useViewerStore((s) => s.matchingMethod);
+  const extractedMaterials = useViewerStore((s) => s.extractedMaterials);
 
   // Build context for the AI - include matching method for better responses
   const lcaContext = lcaResults
@@ -203,6 +259,55 @@ export function ChatPanel() {
     }
   }, [chatMessages]);
 
+  // Detect if message is an EPD agent request
+  const isAgentRequest = useCallback((message: string): boolean => {
+    const agentKeywords = [
+      'find epd', 'find better epd', 'suggest epd', 'epd for',
+      'alternative epd', 'lower carbon', 'lower-carbon',
+      'recycled content', 'sustainable alternative',
+      'better material', 'replace', 'swap', 'change epd',
+      'map epd', 'match epd', 'epd mapping',
+      'find all epd', 'update epd', 'optimize'
+    ];
+    const lowerMessage = message.toLowerCase();
+    return agentKeywords.some(kw => lowerMessage.includes(kw));
+  }, []);
+
+  // Build agent request data from current LCA data
+  const buildAgentRequestData = useCallback(() => {
+    if (!lcaResults) return { materials: [], currentMatches: {} };
+
+    const materials = lcaResults.matches.map(m => ({
+      id: m.material.id,
+      name: m.material.name,
+      category: m.material.category,
+      elementIds: m.material.elementIds,
+      totalVolume: m.material.totalVolume,
+      totalArea: m.material.totalArea,
+      properties: m.material.properties,
+    }));
+
+    const currentMatches: Record<string, {
+      epdId: string;
+      epdName: string;
+      confidence: number;
+      gwp: number;
+      calculatedGWP: number;
+    }> = {};
+
+    lcaResults.matches.forEach(m => {
+      currentMatches[m.material.id] = {
+        epdId: m.epd.id,
+        epdName: m.epd.name,
+        confidence: m.confidence,
+        gwp: m.epd.impacts.gwp,
+        calculatedGWP: m.calculatedGWP,
+      };
+    });
+
+    return { materials, currentMatches };
+  }, [lcaResults]);
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isChatLoading) return;
@@ -215,79 +320,123 @@ export function ChatPanel() {
     // Add user message to store
     addChatMessage({ role: 'user', content: userMessageContent });
 
+    // Determine if we should use the agent
+    const useAgent = isAgentMode || isAgentRequest(userMessageContent);
+
     try {
-      // Build messages for API (from store)
-      const messagesForApi = [
-        ...chatMessages.map((m) => ({ role: m.role, content: m.content })),
-        { role: 'user' as const, content: userMessageContent },
-      ];
+      if (useAgent) {
+        // Use EPD Agent endpoint
+        setAgentProcessing(true);
 
-      const response = await fetch(CHAT_API_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: messagesForApi,
-          context: lcaContext,
-          stream: false, // Request non-streaming response
-        }),
-      });
+        const { materials, currentMatches } = buildAgentRequestData();
+        const response = await fetch(AGENT_API_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: userMessageContent,
+            materials,
+            currentMatches,
+            conversationHistory: chatMessages.slice(-6).map(m => ({
+              role: m.role,
+              content: m.content
+            }))
+          }),
+        });
 
-      if (!response.ok) {
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.error || 'Agent request failed');
+        }
+
         const data = await response.json();
-        throw new Error(data.error || 'Failed to get response');
-      }
 
-      // Check if response is streaming or JSON
-      const contentType = response.headers.get('content-type');
+        // Add agent response with embedded proposals
+        const proposals: EPDProposal[] = data.proposals || [];
+        if (proposals.length > 0) {
+          addEPDProposals(proposals);
+        }
 
-      if (contentType?.includes('application/json')) {
-        // Non-streaming JSON response
-        const data = await response.json();
-        addChatMessage({ role: 'assistant', content: data.content || data.message || 'No response' });
+        // Add message with reference to proposals
+        // Agent returns 'response' field, not 'message'
+        addChatMessage({
+          role: 'assistant',
+          content: data.response || data.message || data.content || 'Analysis complete.',
+          proposals: proposals
+        });
+
+        setAgentProcessing(false);
       } else {
-        // Handle streaming response (fallback)
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error('No response body');
+        // Use regular chat endpoint
+        const messagesForApi = [
+          ...chatMessages.map((m) => ({ role: m.role, content: m.content })),
+          { role: 'user' as const, content: userMessageContent },
+        ];
 
-        const decoder = new TextDecoder();
-        let assistantContent = '';
-        let buffer = '';
-        const assistantId = addChatMessage({ role: 'assistant', content: '' });
+        const response = await fetch(CHAT_API_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: messagesForApi,
+            context: lcaContext,
+            stream: false,
+          }),
+        });
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.error || 'Failed to get response');
+        }
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
+        const contentType = response.headers.get('content-type');
 
-          for (const line of lines) {
-            if (line.startsWith('0:')) {
-              try {
-                const text = JSON.parse(line.slice(2));
-                assistantContent += text;
-                updateChatMessage(assistantId, assistantContent);
-              } catch {
-                // Skip parse errors
+        if (contentType?.includes('application/json')) {
+          const data = await response.json();
+          addChatMessage({ role: 'assistant', content: data.content || data.message || 'No response' });
+        } else {
+          // Handle streaming response (fallback)
+          const reader = response.body?.getReader();
+          if (!reader) throw new Error('No response body');
+
+          const decoder = new TextDecoder();
+          let assistantContent = '';
+          let buffer = '';
+          const assistantId = addChatMessage({ role: 'assistant', content: '' });
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (line.startsWith('0:')) {
+                try {
+                  const text = JSON.parse(line.slice(2));
+                  assistantContent += text;
+                  updateChatMessage(assistantId, assistantContent);
+                } catch {
+                  // Skip parse errors
+                }
               }
             }
           }
-        }
 
-        // Process remaining buffer
-        if (buffer.startsWith('0:')) {
-          try {
-            const text = JSON.parse(buffer.slice(2));
-            assistantContent += text;
-            updateChatMessage(assistantId, assistantContent);
-          } catch {
-            // Skip
+          if (buffer.startsWith('0:')) {
+            try {
+              const text = JSON.parse(buffer.slice(2));
+              assistantContent += text;
+              updateChatMessage(assistantId, assistantContent);
+            } catch {
+              // Skip
+            }
           }
         }
       }
     } catch (err) {
       setChatError(err instanceof Error ? err.message : 'An error occurred');
+      setAgentProcessing(false);
     } finally {
       setChatLoading(false);
     }
@@ -319,30 +468,75 @@ export function ChatPanel() {
     );
   }
 
+  // Get current prompts based on mode
+  const currentPrompts = isAgentMode ? agentPrompts : suggestedPrompts;
+
   return (
     <div className="h-full flex flex-col">
+      {/* Mode Toggle Header */}
+      <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          {isAgentMode ? (
+            <Wand2 className="w-4 h-4 text-primary" />
+          ) : (
+            <Bot className="w-4 h-4 text-muted-foreground" />
+          )}
+          <span className="text-xs font-medium">
+            {isAgentMode ? 'EPD Agent Mode' : 'Chat Mode'}
+          </span>
+        </div>
+        <button
+          onClick={() => setIsAgentMode(!isAgentMode)}
+          className={`px-2 py-1 text-xs rounded-full transition-colors ${
+            isAgentMode
+              ? 'bg-primary/20 text-primary border border-primary/30'
+              : 'bg-muted text-muted-foreground hover:bg-muted/80'
+          }`}
+        >
+          {isAgentMode ? 'Switch to Chat' : 'Enable Agent'}
+        </button>
+      </div>
+
       {/* Messages */}
       <ScrollArea className="flex-1" ref={scrollRef}>
         <div className="p-3 space-y-3">
           {chatMessages.length === 0 && (
             <div className="space-y-3">
               <div className="text-center py-4">
-                <Sparkles className="w-6 h-6 mx-auto mb-2 text-primary" />
-                <p className="text-sm font-medium">AI LCA Assistant</p>
-                <p className="text-xs text-muted-foreground">
-                  Ask questions about your building's environmental impact
-                </p>
+                {isAgentMode ? (
+                  <>
+                    <Wand2 className="w-6 h-6 mx-auto mb-2 text-primary" />
+                    <p className="text-sm font-medium">EPD Agent</p>
+                    <p className="text-xs text-muted-foreground">
+                      AI-powered EPD matching with full model access
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-6 h-6 mx-auto mb-2 text-primary" />
+                    <p className="text-sm font-medium">AI LCA Assistant</p>
+                    <p className="text-xs text-muted-foreground">
+                      Ask questions about your building's environmental impact
+                    </p>
+                  </>
+                )}
               </div>
 
               {/* Suggested prompts */}
               <div className="space-y-2">
-                {suggestedPrompts.map((prompt, i) => (
+                {currentPrompts.map((prompt, i) => (
                   <button
                     key={i}
                     onClick={() => handleSuggestedPrompt(prompt.text)}
-                    className="w-full flex items-center gap-2 p-2 rounded-lg border border-border hover:bg-muted/50 transition-colors text-left text-sm"
+                    className={`w-full flex items-center gap-2 p-2 rounded-lg border transition-colors text-left text-sm ${
+                      isAgentMode
+                        ? 'border-primary/30 hover:bg-primary/10'
+                        : 'border-border hover:bg-muted/50'
+                    }`}
                   >
-                    <prompt.icon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <prompt.icon className={`w-4 h-4 flex-shrink-0 ${
+                      isAgentMode ? 'text-primary' : 'text-muted-foreground'
+                    }`} />
                     <span>{prompt.text}</span>
                   </button>
                 ))}
@@ -351,16 +545,46 @@ export function ChatPanel() {
           )}
 
           {chatMessages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
+            <div key={message.id}>
+              <MessageBubble
+                message={message}
+                onAcceptProposal={acceptProposal}
+                onRejectProposal={rejectProposal}
+              />
+              {/* Render proposals after the message */}
+              {message.proposals && message.proposals.length > 0 && (
+                <MessageProposals
+                  proposals={message.proposals}
+                  onAccept={acceptProposal}
+                  onReject={rejectProposal}
+                />
+              )}
+            </div>
           ))}
 
-          {isChatLoading && chatMessages[chatMessages.length - 1]?.role !== 'assistant' && (
+          {/* Loading indicator */}
+          {(isChatLoading || isAgentProcessing) && chatMessages[chatMessages.length - 1]?.role !== 'assistant' && (
             <div className="flex gap-2">
-              <div className="w-7 h-7 rounded-full flex items-center justify-center bg-muted flex-shrink-0">
-                <Bot className="w-4 h-4" />
+              <div className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 ${
+                isAgentProcessing
+                  ? 'bg-gradient-to-br from-primary to-purple-500 text-white'
+                  : 'bg-muted'
+              }`}>
+                {isAgentProcessing ? (
+                  <Wand2 className="w-4 h-4" />
+                ) : (
+                  <Bot className="w-4 h-4" />
+                )}
               </div>
               <div className="bg-muted rounded-lg px-3 py-2">
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <div className="flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {isAgentProcessing && (
+                    <span className="text-xs text-muted-foreground">
+                      Analyzing model & finding EPDs...
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -382,19 +606,30 @@ export function ChatPanel() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Ask about environmental impact..."
-            className="flex-1 resize-none bg-muted rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary min-h-[40px] max-h-[120px]"
+            placeholder={isAgentMode
+              ? "Ask the agent to find better EPDs..."
+              : "Ask about environmental impact..."
+            }
+            className={`flex-1 resize-none rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 min-h-[40px] max-h-[120px] ${
+              isAgentMode
+                ? 'bg-primary/5 focus:ring-primary border border-primary/20'
+                : 'bg-muted focus:ring-primary'
+            }`}
             rows={1}
-            disabled={isChatLoading}
+            disabled={isChatLoading || isAgentProcessing}
           />
           <Button
             type="submit"
             size="icon"
-            disabled={!input.trim() || isChatLoading}
-            className="flex-shrink-0"
+            disabled={!input.trim() || isChatLoading || isAgentProcessing}
+            className={`flex-shrink-0 ${
+              isAgentMode ? 'bg-gradient-to-br from-primary to-purple-500 hover:from-primary/90 hover:to-purple-500/90' : ''
+            }`}
           >
-            {isChatLoading ? (
+            {isChatLoading || isAgentProcessing ? (
               <Loader2 className="w-4 h-4 animate-spin" />
+            ) : isAgentMode ? (
+              <Wand2 className="w-4 h-4" />
             ) : (
               <Send className="w-4 h-4" />
             )}

@@ -14,6 +14,25 @@ import {
   getEPDDataSourceInfo,
 } from '../../lib/epd/database';
 
+// EPD Proposal from agent
+export interface EPDProposal {
+  id: string;
+  material_id: string;
+  material_name: string;
+  current_epd_id?: string;
+  current_epd_name?: string;
+  current_gwp?: number;
+  proposed_epd_id: string;
+  proposed_epd_name: string;
+  proposed_gwp: number;
+  gwp_difference: number;
+  gwp_difference_percent: number;
+  confidence: number;
+  reasoning: string;
+  key_benefits: string[];
+  status: 'pending' | 'accepted' | 'rejected';
+}
+
 export interface LCASlice {
   // Extracted materials from IFC
   extractedMaterials: ExtractedMaterial[];
@@ -33,6 +52,10 @@ export interface LCASlice {
   epdCount: number;
   isLoadingEPDs: boolean;
 
+  // EPD Agent Proposals
+  epdProposals: EPDProposal[];
+  isAgentProcessing: boolean;
+
   // Actions
   setExtractedMaterials: (materials: ExtractedMaterial[]) => void;
   runEPDMatching: () => void;
@@ -42,9 +65,17 @@ export interface LCASlice {
   checkLLMStatus: () => Promise<void>;
   loadEPDsFromOekobaudat: () => Promise<void>;
 
+  // EPD Proposal Actions
+  addEPDProposals: (proposals: EPDProposal[]) => void;
+  acceptProposal: (proposalId: string) => void;
+  rejectProposal: (proposalId: string) => void;
+  clearProposals: () => void;
+  setAgentProcessing: (processing: boolean) => void;
+
   // Helpers
   getMaterialById: (id: string) => ExtractedMaterial | undefined;
   getMatchByMaterialId: (id: string) => EPDMatch | undefined;
+  getPendingProposals: () => EPDProposal[];
 }
 
 export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, get) => ({
@@ -61,6 +92,10 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
   epdDataSource: 'loading',
   epdCount: 0,
   isLoadingEPDs: false,
+
+  // EPD Agent state
+  epdProposals: [],
+  isAgentProcessing: false,
 
   // Actions
   setExtractedMaterials: (materials) => {
@@ -159,6 +194,80 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
     console.log(`[LCA] LLM availability: ${available}`);
   },
 
+  // EPD Proposal Actions
+  addEPDProposals: (proposals) => {
+    set((state) => ({
+      epdProposals: [...state.epdProposals, ...proposals],
+    }));
+  },
+
+  acceptProposal: (proposalId) => {
+    const { epdProposals, lcaResults } = get();
+    const proposal = epdProposals.find(p => p.id === proposalId);
+
+    if (!proposal || !lcaResults) return;
+
+    // Update the proposal status
+    const updatedProposals = epdProposals.map(p =>
+      p.id === proposalId ? { ...p, status: 'accepted' as const } : p
+    );
+
+    // Update LCA results with the new EPD
+    // For demo, we update the calculated GWP based on the proposal
+    const updatedMatches = lcaResults.matches.map(match => {
+      if (match.material.id === proposal.material_id) {
+        return {
+          ...match,
+          epd: {
+            ...match.epd,
+            id: proposal.proposed_epd_id,
+            name: proposal.proposed_epd_name,
+          },
+          calculatedGWP: proposal.proposed_gwp,
+          confidence: proposal.confidence,
+          matchReason: `Agent: ${proposal.reasoning}`,
+        };
+      }
+      return match;
+    });
+
+    // Recalculate totals
+    const totalGWP = updatedMatches.reduce((sum, m) => sum + m.calculatedGWP, 0);
+    const byCategory = new Map<MaterialCategory, number>();
+    for (const match of updatedMatches) {
+      const cat = match.material.category;
+      byCategory.set(cat, (byCategory.get(cat) || 0) + match.calculatedGWP);
+    }
+
+    set({
+      epdProposals: updatedProposals,
+      lcaResults: {
+        ...lcaResults,
+        matches: updatedMatches,
+        totalGWP,
+        byCategory,
+      },
+    });
+
+    console.log(`[LCA] Accepted proposal ${proposalId}, new total GWP: ${totalGWP.toFixed(0)} kg CO₂e`);
+  },
+
+  rejectProposal: (proposalId) => {
+    set((state) => ({
+      epdProposals: state.epdProposals.map(p =>
+        p.id === proposalId ? { ...p, status: 'rejected' as const } : p
+      ),
+    }));
+  },
+
+  clearProposals: () => {
+    set({ epdProposals: [] });
+  },
+
+  setAgentProcessing: (processing) => {
+    set({ isAgentProcessing: processing });
+  },
+
   // Helpers
   getMaterialById: (id) => {
     return get().extractedMaterials.find(m => m.id === id);
@@ -167,6 +276,10 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
   getMatchByMaterialId: (id) => {
     const { lcaResults } = get();
     return lcaResults?.matches.find(m => m.material.id === id);
+  },
+
+  getPendingProposals: () => {
+    return get().epdProposals.filter(p => p.status === 'pending');
   },
 });
 
