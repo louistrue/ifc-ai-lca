@@ -1,12 +1,18 @@
 /**
  * LCA (Life Cycle Assessment) State Slice
  * Manages EPD matching results and LCA calculations
+ * With Ökobaudat integration for real EPD data
  */
 
 import type { StateCreator } from 'zustand';
 import type { ExtractedMaterial, EPDMatch, LCAResults, MaterialCategory } from '../../lib/epd/types';
 import { matchAllMaterials, detectCategory, findBestMatch } from '../../lib/epd/matcher';
 import { matchAllMaterialsWithLLM, checkLLMAvailability } from '../../lib/epd/llm-matcher';
+import {
+  loadOekobaudatEPDs,
+  checkOekobaudatAvailability,
+  getEPDDataSourceInfo,
+} from '../../lib/epd/database';
 
 export interface LCASlice {
   // Extracted materials from IFC
@@ -22,6 +28,11 @@ export interface LCASlice {
   matchingMethod: 'none' | 'algorithmic' | 'llm';
   llmAvailable: boolean;
 
+  // Ökobaudat State
+  epdDataSource: 'oekobaudat' | 'fallback' | 'loading';
+  epdCount: number;
+  isLoadingEPDs: boolean;
+
   // Actions
   setExtractedMaterials: (materials: ExtractedMaterial[]) => void;
   runEPDMatching: () => void;
@@ -29,6 +40,7 @@ export interface LCASlice {
   selectMaterial: (materialId: string | null) => void;
   clearLCAResults: () => void;
   checkLLMStatus: () => Promise<void>;
+  loadEPDsFromOekobaudat: () => Promise<void>;
 
   // Helpers
   getMaterialById: (id: string) => ExtractedMaterial | undefined;
@@ -45,9 +57,43 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
   matchingMethod: 'none',
   llmAvailable: false,
 
+  // Ökobaudat state
+  epdDataSource: 'loading',
+  epdCount: 0,
+  isLoadingEPDs: false,
+
   // Actions
   setExtractedMaterials: (materials) => {
     set({ extractedMaterials: materials });
+  },
+
+  loadEPDsFromOekobaudat: async () => {
+    const { isLoadingEPDs } = get();
+    if (isLoadingEPDs) return;
+
+    set({ isLoadingEPDs: true, epdDataSource: 'loading' });
+
+    try {
+      console.log('[LCA] Loading EPDs from Ökobaudat...');
+      const epds = await loadOekobaudatEPDs();
+      const info = getEPDDataSourceInfo();
+
+      console.log(`[LCA] EPD data loaded: ${info.count} EPDs from ${info.source}`);
+
+      set({
+        isLoadingEPDs: false,
+        epdDataSource: info.source,
+        epdCount: info.count,
+      });
+    } catch (error) {
+      console.error('[LCA] Failed to load EPDs:', error);
+      const info = getEPDDataSourceInfo();
+      set({
+        isLoadingEPDs: false,
+        epdDataSource: info.source,
+        epdCount: info.count,
+      });
+    }
   },
 
   runEPDMatching: () => {

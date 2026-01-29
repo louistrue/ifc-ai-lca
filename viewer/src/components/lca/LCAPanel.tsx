@@ -9,7 +9,7 @@ import { extractMaterialsFromIFC } from '../../store/slices/lcaSlice';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs';
 import { ScrollArea } from '../ui/scroll-area';
 import { Badge } from '../ui/badge';
-import { Leaf, AlertTriangle, CheckCircle, ArrowRight, Loader2, Sparkles, Cpu } from 'lucide-react';
+import { Leaf, AlertTriangle, CheckCircle, ArrowRight, Loader2, Sparkles, Cpu, Database, Cloud } from 'lucide-react';
 import type { EPDMatch, ExtractedMaterial, MaterialCategory } from '../../lib/epd/types';
 
 const categoryColors: Record<MaterialCategory, string> = {
@@ -206,6 +206,17 @@ export function LCAPanel() {
   const selectMaterial = useViewerStore((s) => s.selectMaterial);
   const setSelectedEntityIds = useViewerStore((s) => s.setSelectedEntityIds);
 
+  // Ökobaudat state
+  const epdDataSource = useViewerStore((s) => s.epdDataSource);
+  const epdCount = useViewerStore((s) => s.epdCount);
+  const isLoadingEPDs = useViewerStore((s) => s.isLoadingEPDs);
+  const loadEPDsFromOekobaudat = useViewerStore((s) => s.loadEPDsFromOekobaudat);
+
+  // Load EPDs from Ökobaudat on mount
+  useEffect(() => {
+    loadEPDsFromOekobaudat();
+  }, [loadEPDsFromOekobaudat]);
+
   // Extract materials when IFC data is loaded
   useEffect(() => {
     if (ifcDataStore && geometryResult) {
@@ -275,22 +286,45 @@ export function LCAPanel() {
         <TabsTrigger value="summary">Summary</TabsTrigger>
       </TabsList>
 
-      {/* Matching method indicator */}
-      {matchingMethod !== 'none' && (
-        <div className="mx-2 mt-2 flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
-          {matchingMethod === 'llm' ? (
+      {/* Data source and matching method indicator */}
+      <div className="mx-2 mt-2 flex flex-col items-center gap-1 text-xs text-muted-foreground">
+        {/* EPD Data Source */}
+        <div className="flex items-center gap-1.5">
+          {isLoadingEPDs ? (
             <>
-              <Sparkles className="w-3 h-3 text-primary" />
-              <span>AI-matched (GPT-4o-mini)</span>
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span>Loading EPD database...</span>
+            </>
+          ) : epdDataSource === 'oekobaudat' ? (
+            <>
+              <Cloud className="w-3 h-3 text-green-500" />
+              <span className="text-green-600">Ökobaudat ({epdCount} EPDs)</span>
             </>
           ) : (
             <>
-              <Cpu className="w-3 h-3" />
-              <span>Algorithmic matching</span>
+              <Database className="w-3 h-3 text-yellow-500" />
+              <span className="text-yellow-600">Fallback data ({epdCount} EPDs)</span>
             </>
           )}
         </div>
-      )}
+
+        {/* Matching method */}
+        {matchingMethod !== 'none' && (
+          <div className="flex items-center gap-1.5">
+            {matchingMethod === 'llm' ? (
+              <>
+                <Sparkles className="w-3 h-3 text-primary" />
+                <span>AI-matched (GPT-4o-mini)</span>
+              </>
+            ) : (
+              <>
+                <Cpu className="w-3 h-3" />
+                <span>Algorithmic matching</span>
+              </>
+            )}
+          </div>
+        )}
+      </div>
 
       <TabsContent value="materials" className="flex-1 min-h-0 m-0">
         <ScrollArea className="h-full">
