@@ -122,7 +122,8 @@ export function extractMaterialsFromIFC(
 
           if (materialName && typeof materialName === 'string') {
             const propsMap = props instanceof Map ? props : new Map(Object.entries(props || {}));
-            addOrUpdateMaterial(materialMap, materialName, entityId, propsMap, ifcDataStore.quantities?.get(entityId));
+            const q = getQuantitiesForEntity(entityId);
+            addOrUpdateMaterial(materialMap, materialName, entityId, propsMap, q);
           }
         }
       }
@@ -130,6 +131,57 @@ export function extractMaterialsFromIFC(
       console.warn('[LCA] Failed to extract materials from properties:', err);
     }
   }
+
+  // Helper to safely get quantities for an entity
+  const getQuantitiesForEntity = (entityId: number): { volume: number; area: number; weight: number } => {
+    let volume = 0;
+    let area = 0;
+    let weight = 0;
+
+    try {
+      if (!ifcDataStore.quantities) return { volume, area, weight };
+
+      // Handle both Map and Object access
+      let qsets: unknown;
+      if (ifcDataStore.quantities instanceof Map) {
+        qsets = ifcDataStore.quantities.get(entityId);
+      } else if (typeof ifcDataStore.quantities === 'object') {
+        qsets = (ifcDataStore.quantities as Record<number, unknown>)[entityId];
+      }
+
+      if (!qsets) return { volume, area, weight };
+
+      // Iterate through quantity sets
+      const iterateQsets = qsets instanceof Map ? qsets : (typeof qsets === 'object' ? Object.entries(qsets) : []);
+      for (const entry of iterateQsets) {
+        const quantities = entry instanceof Array ? entry[1] : entry;
+        if (!quantities) continue;
+
+        const iterateQuantities = quantities instanceof Map ? quantities : (typeof quantities === 'object' ? Object.entries(quantities) : []);
+        for (const qEntry of iterateQuantities) {
+          const [qName, qValue] = qEntry instanceof Array ? qEntry : [qEntry, null];
+          if (!qValue || typeof qValue !== 'object') continue;
+
+          const lowerName = String(qName).toLowerCase();
+          const value = (qValue as { value?: number }).value || 0;
+
+          if (lowerName.includes('volume') || lowerName.includes('netvolume')) {
+            volume += value;
+          }
+          if (lowerName.includes('area') || lowerName.includes('netarea')) {
+            area += value;
+          }
+          if (lowerName.includes('weight') || lowerName.includes('mass')) {
+            weight += value;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[LCA] Failed to get quantities for entity:', entityId, err);
+    }
+
+    return { volume, area, weight };
+  };
 
   // If no materials found from properties, try to infer from IFC types
   if (materialMap.size === 0 && geometryMeshes) {
@@ -153,19 +205,9 @@ export function extractMaterialsFromIFC(
       let totalArea = 0;
 
       for (const entityId of ids) {
-        const qsets = ifcDataStore.quantities?.get(entityId);
-        if (qsets) {
-          for (const [, quantities] of qsets) {
-            for (const [qName, qValue] of quantities) {
-              if (qName.toLowerCase().includes('volume') || qName.toLowerCase().includes('netvolume')) {
-                totalVolume += qValue.value || 0;
-              }
-              if (qName.toLowerCase().includes('area') || qName.toLowerCase().includes('netarea')) {
-                totalArea += qValue.value || 0;
-              }
-            }
-          }
-        }
+        const q = getQuantitiesForEntity(entityId);
+        totalVolume += q.volume;
+        totalArea += q.area;
       }
 
       const material: ExtractedMaterial = {
@@ -190,32 +232,12 @@ function addOrUpdateMaterial(
   name: string,
   entityId: number,
   props: Map<string, unknown>,
-  quantities?: Map<string, Map<string, { value: number; type: string }>>
+  quantities: { volume: number; area: number; weight: number }
 ): void {
   const id = `mat-${name.toLowerCase().replace(/\s+/g, '-')}`;
   const existing = materialMap.get(id);
 
-  // Extract quantities
-  let volume = 0;
-  let area = 0;
-  let weight = 0;
-
-  if (quantities) {
-    for (const [, qmap] of quantities) {
-      for (const [qName, qValue] of qmap) {
-        const lowerName = qName.toLowerCase();
-        if (lowerName.includes('volume') || lowerName.includes('netvolume')) {
-          volume += qValue.value || 0;
-        }
-        if (lowerName.includes('area') || lowerName.includes('netarea')) {
-          area += qValue.value || 0;
-        }
-        if (lowerName.includes('weight') || lowerName.includes('mass')) {
-          weight += qValue.value || 0;
-        }
-      }
-    }
-  }
+  const { volume, area, weight } = quantities;
 
   if (existing) {
     existing.elementIds.push(entityId);
