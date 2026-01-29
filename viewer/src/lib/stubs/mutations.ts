@@ -14,6 +14,16 @@ export class MutationEngine {
   clear() {}
 }
 
+export class MutablePropertyView {
+  constructor(_store: unknown) {}
+  getProperties(_entityId: number) { return []; }
+  setProperty(_entityId: number, _psetName: string, _propName: string, _value: unknown) {}
+  addPropertySet(_entityId: number, _psetName: string) {}
+  removePropertySet(_entityId: number, _psetName: string) {}
+  addProperty(_entityId: number, _psetName: string, _propName: string, _value: unknown) {}
+  removeProperty(_entityId: number, _psetName: string, _propName: string) {}
+}
+
 export function createMutation(_type: string, _data: unknown) {
   return null;
 }
