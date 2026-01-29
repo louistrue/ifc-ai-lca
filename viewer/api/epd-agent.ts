@@ -2,35 +2,92 @@
  * Vercel Serverless Function for EPD Agent
  * Handles intelligent EPD matching using LLM with tool calling
  *
- * The agent can:
- * - Query building elements from IFC data
- * - Search and compare EPDs from the database
+ * The agent has full access to model context including:
+ * - Project info (element counts, spatial structure)
+ * - Materials with element type breakdowns
+ * - Quantities (volume, area, weight) per material
+ * - Element properties and spatial locations
+ * - Current EPD mappings with GWP values
+ *
+ * Tools enable the agent to:
+ * - Query and filter model data intelligently
+ * - Search EPD database with technical criteria
  * - Propose EPD mappings with detailed reasoning
  */
 
 export const config = {
   runtime: 'edge',
-  maxDuration: 60, // Allow longer execution for agent loops
+  maxDuration: 60,
 };
 
 // ============ Types ============
 
-interface MaterialInfo {
+interface MaterialSummary {
   id: string;
   name: string;
   category: string;
-  elementIds: number[];
-  totalVolume?: number;
-  totalArea?: number;
-  properties?: Record<string, unknown>;
+  totalVolume: number;
+  totalArea: number;
+  totalWeight: number | null;
+  elementCount: number;
+  elementTypes: Record<string, number>;
+  commonProperties?: {
+    thicknesses?: number[];
+    fireRatings?: string[];
+    strengthClasses?: string[];
+  };
+  currentEpd?: {
+    id: string;
+    name: string;
+    gwp: number;
+    confidence: number;
+    calculatedGwp: number;
+  };
 }
 
-interface CurrentMatch {
-  epdId: string;
-  epdName: string;
-  confidence: number;
-  gwp: number;
-  calculatedGWP: number;
+interface StoreySummary {
+  id: number;
+  name: string;
+  elevation: number;
+  elementCount: number;
+  materialBreakdown: Record<string, number>;
+}
+
+interface ModelSummary {
+  project: {
+    name: string;
+    elementCount: number;
+    buildingCount: number;
+    storeyCount: number;
+    totalVolume: number;
+  };
+  materials: MaterialSummary[];
+  storeys: StoreySummary[];
+  lca?: {
+    totalGwp: number;
+    gwpByCategory: Record<string, number>;
+  };
+}
+
+interface ElementDetail {
+  id: number;
+  type: string;
+  name: string;
+  description?: string;
+  volume?: number;
+  area?: number;
+  weight?: number;
+  storeyId?: number;
+  storeyName?: string;
+  properties: Record<string, string | number | boolean>;
+}
+
+interface ElementIndex {
+  id: number;
+  type: string;
+  name: string;
+  materialId: string | null;
+  storeyId: number | null;
 }
 
 interface EPDProposal {
@@ -53,13 +110,9 @@ interface EPDProposal {
 
 interface AgentRequest {
   message: string;
-  materials: MaterialInfo[];
-  currentMatches: Record<string, CurrentMatch>;
-  buildingInfo?: {
-    name?: string;
-    storeys?: string[];
-    totalElements?: number;
-  };
+  modelContext: ModelSummary;
+  elementIndex?: ElementIndex[];
+  elementDetails?: Record<string, ElementDetail[]>; // Pre-fetched details keyed by materialId
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
@@ -78,22 +131,11 @@ const toolDefinitions = [
   {
     type: 'function',
     function: {
-      name: 'query_building_elements',
-      description: 'Query building elements from the loaded IFC model. Returns a summary of elements grouped by type and material.',
+      name: 'get_model_overview',
+      description: 'Get a comprehensive overview of the building model including project info, material summary, and spatial structure.',
       parameters: {
         type: 'object',
-        properties: {
-          element_type: {
-            type: 'string',
-            enum: ['wall', 'slab', 'column', 'beam', 'window', 'door', 'roof', 'stair', 'railing', 'all'],
-            description: 'Type of element to query. Use "all" to get a summary of all elements.',
-          },
-          include_properties: {
-            type: 'boolean',
-            description: 'Whether to include detailed properties for each element group.',
-          },
-        },
-        required: ['element_type'],
+        properties: {},
       },
     },
   },
@@ -101,13 +143,13 @@ const toolDefinitions = [
     type: 'function',
     function: {
       name: 'get_material_details',
-      description: 'Get detailed information about a specific material in the building, including its current EPD match.',
+      description: 'Get detailed information about a specific material including element types, quantities, properties, and current EPD match.',
       parameters: {
         type: 'object',
         properties: {
           material_id: {
             type: 'string',
-            description: 'The material ID.',
+            description: 'The material ID to get details for.',
           },
         },
         required: ['material_id'],
@@ -117,8 +159,61 @@ const toolDefinitions = [
   {
     type: 'function',
     function: {
+      name: 'get_elements_for_material',
+      description: 'Get detailed element information for a specific material, including individual element properties, quantities, and spatial locations.',
+      parameters: {
+        type: 'object',
+        properties: {
+          material_id: {
+            type: 'string',
+            description: 'The material ID.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum number of elements to return (default 20).',
+          },
+        },
+        required: ['material_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_spatial_breakdown',
+      description: 'Get materials and elements grouped by building storey for spatial analysis.',
+      parameters: {
+        type: 'object',
+        properties: {
+          storey_name: {
+            type: 'string',
+            description: 'Optional: filter to a specific storey by name (partial match).',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_high_impact_elements',
+      description: 'Get the elements with highest environmental impact (GWP contribution), useful for identifying optimization priorities.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: {
+            type: 'number',
+            description: 'Maximum number of elements to return (default 10).',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'search_epd_database',
-      description: 'Search the EPD database with specific criteria. Returns matching EPDs sorted by relevance.',
+      description: 'Search the EPD database with specific criteria. Returns matching EPDs sorted by GWP (lowest first).',
       parameters: {
         type: 'object',
         properties: {
@@ -127,19 +222,29 @@ const toolDefinitions = [
             enum: ['CONCRETE', 'STEEL', 'WOOD', 'GLASS', 'INSULATION', 'MASONRY', 'ALUMINUM', 'GYPSUM', 'PLASTIC', 'MEMBRANE'],
             description: 'Material category to search in.',
           },
-          gwp_max: { type: 'number', description: 'Maximum GWP in kg CO₂e per declared unit.' },
-          fire_rating_min: { type: 'string', description: 'Minimum fire rating required (e.g., "REI 60").' },
-          strength_class: { type: 'string', description: 'Strength class like "C30/37".' },
+          gwp_max: {
+            type: 'number',
+            description: 'Maximum GWP in kg CO₂e per declared unit.',
+          },
+          keywords: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Keywords to match in EPD name/description.',
+          },
           use_case: {
             type: 'string',
             enum: ['structural', 'facade', 'interior', 'foundation', 'thermal-insulation', 'fire-protection', 'sustainable'],
+            description: 'Intended use case.',
           },
           suitable_for: {
             type: 'string',
             enum: ['wall', 'slab', 'column', 'beam', 'roof', 'window', 'facade', 'ceiling'],
+            description: 'Element type the EPD should be suitable for.',
           },
-          keywords: { type: 'array', items: { type: 'string' } },
-          recycled_content_min: { type: 'number' },
+          recycled_content_min: {
+            type: 'number',
+            description: 'Minimum recycled content percentage.',
+          },
         },
       },
     },
@@ -148,11 +253,14 @@ const toolDefinitions = [
     type: 'function',
     function: {
       name: 'get_epd_details',
-      description: 'Get full details for a specific EPD including all impacts and technical properties.',
+      description: 'Get full details for a specific EPD including all environmental impacts and technical properties.',
       parameters: {
         type: 'object',
         properties: {
-          epd_id: { type: 'string', description: 'The EPD ID.' },
+          epd_id: {
+            type: 'string',
+            description: 'The EPD ID.',
+          },
         },
         required: ['epd_id'],
       },
@@ -162,11 +270,15 @@ const toolDefinitions = [
     type: 'function',
     function: {
       name: 'compare_epds',
-      description: 'Compare multiple EPDs side by side.',
+      description: 'Compare multiple EPDs side by side to help select the best option.',
       parameters: {
         type: 'object',
         properties: {
-          epd_ids: { type: 'array', items: { type: 'string' }, description: 'EPD IDs to compare (2-4).' },
+          epd_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'EPD IDs to compare (2-4 EPDs).',
+          },
         },
         required: ['epd_ids'],
       },
@@ -176,15 +288,33 @@ const toolDefinitions = [
     type: 'function',
     function: {
       name: 'propose_epd_mapping',
-      description: 'Propose a new EPD mapping for a material. Creates a proposal for the user to accept/reject.',
+      description: 'Propose a new EPD mapping for a material. Creates a proposal for the user to accept or reject.',
       parameters: {
         type: 'object',
         properties: {
-          material_id: { type: 'string' },
-          proposed_epd_id: { type: 'string' },
-          confidence: { type: 'number', minimum: 0, maximum: 100 },
-          reasoning: { type: 'string', description: 'Detailed explanation.' },
-          key_benefits: { type: 'array', items: { type: 'string' } },
+          material_id: {
+            type: 'string',
+            description: 'The material ID to map.',
+          },
+          proposed_epd_id: {
+            type: 'string',
+            description: 'The EPD ID to propose.',
+          },
+          confidence: {
+            type: 'number',
+            minimum: 0,
+            maximum: 100,
+            description: 'Confidence level (0-100) based on technical match quality.',
+          },
+          reasoning: {
+            type: 'string',
+            description: 'Detailed explanation of why this EPD is appropriate, referencing element types, properties, and use cases.',
+          },
+          key_benefits: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Key benefits of this EPD choice (e.g., "42% lower GWP", "Matches fire rating requirement").',
+          },
         },
         required: ['material_id', 'proposed_epd_id', 'confidence', 'reasoning'],
       },
@@ -192,7 +322,7 @@ const toolDefinitions = [
   },
 ];
 
-// ============ Mock EPD Data (subset for serverless) ============
+// ============ Mock EPD Database ============
 
 const mockEPDs: Record<string, {
   id: string;
@@ -204,50 +334,182 @@ const mockEPDs: Record<string, {
   recycled_content?: number;
   use_cases: string[];
   suitable_for: string[];
+  keywords: string[];
 }> = {
-  'mock-concrete-001': { id: 'mock-concrete-001', name: 'Ready-Mix Concrete C30/37', category: 'CONCRETE', gwp: 285, unit: 'm3', fire_rating: 'REI 120', recycled_content: 5, use_cases: ['structural'], suitable_for: ['wall', 'slab', 'column'] },
-  'mock-concrete-002': { id: 'mock-concrete-002', name: 'Low-Carbon Concrete C30/37 (CEM III)', category: 'CONCRETE', gwp: 165, unit: 'm3', fire_rating: 'REI 120', recycled_content: 35, use_cases: ['structural', 'sustainable'], suitable_for: ['wall', 'slab', 'column'] },
-  'mock-concrete-003': { id: 'mock-concrete-003', name: 'High-Strength Concrete C50/60', category: 'CONCRETE', gwp: 380, unit: 'm3', fire_rating: 'REI 120', recycled_content: 3, use_cases: ['structural', 'high-rise'], suitable_for: ['column', 'beam'] },
-  'mock-steel-001': { id: 'mock-steel-001', name: 'Structural Steel S355', category: 'STEEL', gwp: 1.85, unit: 'kg', recycled_content: 25, use_cases: ['structural'], suitable_for: ['beam', 'column'] },
-  'mock-steel-002': { id: 'mock-steel-002', name: 'Recycled Steel S355 (EAF)', category: 'STEEL', gwp: 0.65, unit: 'kg', recycled_content: 95, use_cases: ['structural', 'sustainable'], suitable_for: ['beam', 'column'] },
-  'mock-steel-003': { id: 'mock-steel-003', name: 'Reinforcing Steel (Rebar)', category: 'STEEL', gwp: 0.76, unit: 'kg', recycled_content: 85, use_cases: ['reinforcement'], suitable_for: ['slab', 'wall', 'beam'] },
-  'mock-wood-001': { id: 'mock-wood-001', name: 'Cross-Laminated Timber (CLT)', category: 'WOOD', gwp: -680, unit: 'm3', fire_rating: 'REI 60', use_cases: ['structural', 'sustainable'], suitable_for: ['wall', 'slab', 'roof'] },
-  'mock-wood-002': { id: 'mock-wood-002', name: 'Glulam Beam GL24h', category: 'WOOD', gwp: -720, unit: 'm3', fire_rating: 'R 60', use_cases: ['structural'], suitable_for: ['beam', 'column'] },
-  'mock-insulation-001': { id: 'mock-insulation-001', name: 'Mineral Wool (Stone Wool)', category: 'INSULATION', gwp: 1.12, unit: 'kg', fire_rating: 'A1', recycled_content: 25, use_cases: ['thermal-insulation', 'fire-protection'], suitable_for: ['wall', 'roof'] },
-  'mock-insulation-003': { id: 'mock-insulation-003', name: 'Wood Fiber Insulation', category: 'INSULATION', gwp: -0.85, unit: 'kg', use_cases: ['thermal-insulation', 'sustainable'], suitable_for: ['wall', 'roof'] },
-  'mock-glass-001': { id: 'mock-glass-001', name: 'Triple Glazing Unit (Argon)', category: 'GLASS', gwp: 32, unit: 'm2', recycled_content: 20, use_cases: ['glazing', 'energy-efficient'], suitable_for: ['window', 'facade'] },
-  'mock-gypsum-001': { id: 'mock-gypsum-001', name: 'Gypsum Board (Standard)', category: 'GYPSUM', gwp: 2.8, unit: 'm2', fire_rating: 'EI 30', recycled_content: 25, use_cases: ['interior', 'partition'], suitable_for: ['wall', 'ceiling'] },
-  'mock-gypsum-002': { id: 'mock-gypsum-002', name: 'Fire-Rated Gypsum Board (F)', category: 'GYPSUM', gwp: 3.5, unit: 'm2', fire_rating: 'EI 60', recycled_content: 20, use_cases: ['interior', 'fire-protection'], suitable_for: ['wall', 'ceiling'] },
-  'mock-aluminum-001': { id: 'mock-aluminum-001', name: 'Aluminum Profile (Primary)', category: 'ALUMINUM', gwp: 8.5, unit: 'kg', recycled_content: 30, use_cases: ['facade', 'window-frame'], suitable_for: ['window', 'facade'] },
-  'mock-aluminum-002': { id: 'mock-aluminum-002', name: 'Recycled Aluminum Profile', category: 'ALUMINUM', gwp: 2.1, unit: 'kg', recycled_content: 75, use_cases: ['facade', 'sustainable'], suitable_for: ['window', 'facade'] },
-  'mock-masonry-001': { id: 'mock-masonry-001', name: 'Clay Brick (Facing)', category: 'MASONRY', gwp: 0.21, unit: 'kg', fire_rating: 'REI 90', use_cases: ['facade', 'masonry'], suitable_for: ['wall', 'facade'] },
+  'epd-concrete-001': { id: 'epd-concrete-001', name: 'Ready-Mix Concrete C30/37', category: 'CONCRETE', gwp: 285, unit: 'm3', fire_rating: 'REI 120', recycled_content: 5, use_cases: ['structural'], suitable_for: ['wall', 'slab', 'column'], keywords: ['concrete', 'c30', 'standard'] },
+  'epd-concrete-002': { id: 'epd-concrete-002', name: 'Low-Carbon Concrete C30/37 (CEM III)', category: 'CONCRETE', gwp: 165, unit: 'm3', fire_rating: 'REI 120', recycled_content: 35, use_cases: ['structural', 'sustainable'], suitable_for: ['wall', 'slab', 'column'], keywords: ['concrete', 'c30', 'low-carbon', 'cem3', 'sustainable'] },
+  'epd-concrete-003': { id: 'epd-concrete-003', name: 'High-Strength Concrete C50/60', category: 'CONCRETE', gwp: 380, unit: 'm3', fire_rating: 'REI 120', recycled_content: 3, use_cases: ['structural'], suitable_for: ['column', 'beam'], keywords: ['concrete', 'c50', 'high-strength'] },
+  'epd-concrete-004': { id: 'epd-concrete-004', name: 'Recycite ECO Concrete C25/30', category: 'CONCRETE', gwp: 145, unit: 'm3', fire_rating: 'REI 90', recycled_content: 50, use_cases: ['structural', 'sustainable'], suitable_for: ['wall', 'slab'], keywords: ['concrete', 'recycled', 'eco', 'sustainable'] },
+  'epd-steel-001': { id: 'epd-steel-001', name: 'Structural Steel S355 (BF-BOF)', category: 'STEEL', gwp: 1.85, unit: 'kg', recycled_content: 25, use_cases: ['structural'], suitable_for: ['beam', 'column'], keywords: ['steel', 's355', 'structural'] },
+  'epd-steel-002': { id: 'epd-steel-002', name: 'Recycled Steel S355 (EAF)', category: 'STEEL', gwp: 0.65, unit: 'kg', recycled_content: 95, use_cases: ['structural', 'sustainable'], suitable_for: ['beam', 'column'], keywords: ['steel', 's355', 'recycled', 'eaf', 'sustainable'] },
+  'epd-steel-003': { id: 'epd-steel-003', name: 'Reinforcing Steel (Rebar)', category: 'STEEL', gwp: 0.76, unit: 'kg', recycled_content: 85, use_cases: ['reinforcement'], suitable_for: ['slab', 'wall', 'beam'], keywords: ['steel', 'rebar', 'reinforcement'] },
+  'epd-wood-001': { id: 'epd-wood-001', name: 'Cross-Laminated Timber (CLT)', category: 'WOOD', gwp: -680, unit: 'm3', fire_rating: 'REI 60', use_cases: ['structural', 'sustainable'], suitable_for: ['wall', 'slab', 'roof'], keywords: ['wood', 'clt', 'timber', 'mass-timber', 'sustainable'] },
+  'epd-wood-002': { id: 'epd-wood-002', name: 'Glulam Beam GL24h', category: 'WOOD', gwp: -720, unit: 'm3', fire_rating: 'R 60', use_cases: ['structural'], suitable_for: ['beam', 'column'], keywords: ['wood', 'glulam', 'beam', 'timber'] },
+  'epd-wood-003': { id: 'epd-wood-003', name: 'Softwood Lumber (FSC)', category: 'WOOD', gwp: -450, unit: 'm3', use_cases: ['framing', 'sustainable'], suitable_for: ['wall', 'roof'], keywords: ['wood', 'lumber', 'softwood', 'fsc'] },
+  'epd-insulation-001': { id: 'epd-insulation-001', name: 'Mineral Wool (Stone Wool)', category: 'INSULATION', gwp: 1.12, unit: 'kg', fire_rating: 'A1', recycled_content: 25, use_cases: ['thermal-insulation', 'fire-protection'], suitable_for: ['wall', 'roof'], keywords: ['insulation', 'mineral', 'wool', 'stone', 'fire-resistant'] },
+  'epd-insulation-002': { id: 'epd-insulation-002', name: 'EPS Insulation Board', category: 'INSULATION', gwp: 3.4, unit: 'kg', use_cases: ['thermal-insulation'], suitable_for: ['wall', 'roof', 'slab'], keywords: ['insulation', 'eps', 'polystyrene', 'foam'] },
+  'epd-insulation-003': { id: 'epd-insulation-003', name: 'Wood Fiber Insulation', category: 'INSULATION', gwp: -0.85, unit: 'kg', use_cases: ['thermal-insulation', 'sustainable'], suitable_for: ['wall', 'roof'], keywords: ['insulation', 'wood', 'fiber', 'natural', 'sustainable'] },
+  'epd-glass-001': { id: 'epd-glass-001', name: 'Triple Glazing Unit (Argon)', category: 'GLASS', gwp: 32, unit: 'm2', recycled_content: 20, use_cases: ['glazing'], suitable_for: ['window', 'facade'], keywords: ['glass', 'triple', 'glazing', 'argon'] },
+  'epd-glass-002': { id: 'epd-glass-002', name: 'Double Glazing Low-E', category: 'GLASS', gwp: 24, unit: 'm2', recycled_content: 15, use_cases: ['glazing'], suitable_for: ['window', 'facade'], keywords: ['glass', 'double', 'low-e', 'glazing'] },
+  'epd-gypsum-001': { id: 'epd-gypsum-001', name: 'Gypsum Board (Standard)', category: 'GYPSUM', gwp: 2.8, unit: 'm2', fire_rating: 'EI 30', recycled_content: 25, use_cases: ['interior'], suitable_for: ['wall', 'ceiling'], keywords: ['gypsum', 'drywall', 'plasterboard'] },
+  'epd-gypsum-002': { id: 'epd-gypsum-002', name: 'Fire-Rated Gypsum Board (F)', category: 'GYPSUM', gwp: 3.5, unit: 'm2', fire_rating: 'EI 60', recycled_content: 20, use_cases: ['interior', 'fire-protection'], suitable_for: ['wall', 'ceiling'], keywords: ['gypsum', 'fire-rated', 'fireproof'] },
+  'epd-aluminum-001': { id: 'epd-aluminum-001', name: 'Aluminum Profile (Primary)', category: 'ALUMINUM', gwp: 8.5, unit: 'kg', recycled_content: 30, use_cases: ['facade'], suitable_for: ['window', 'facade'], keywords: ['aluminum', 'profile', 'facade'] },
+  'epd-aluminum-002': { id: 'epd-aluminum-002', name: 'Recycled Aluminum Profile', category: 'ALUMINUM', gwp: 2.1, unit: 'kg', recycled_content: 75, use_cases: ['facade', 'sustainable'], suitable_for: ['window', 'facade'], keywords: ['aluminum', 'recycled', 'sustainable'] },
+  'epd-masonry-001': { id: 'epd-masonry-001', name: 'Clay Brick (Facing)', category: 'MASONRY', gwp: 0.21, unit: 'kg', fire_rating: 'REI 90', use_cases: ['facade'], suitable_for: ['wall', 'facade'], keywords: ['brick', 'clay', 'masonry', 'facing'] },
+  'epd-masonry-002': { id: 'epd-masonry-002', name: 'Concrete Block (CMU)', category: 'MASONRY', gwp: 0.12, unit: 'kg', fire_rating: 'REI 120', use_cases: ['structural', 'facade'], suitable_for: ['wall'], keywords: ['block', 'cmu', 'concrete', 'masonry'] },
 };
 
 // ============ Tool Handlers ============
 
-function handleQueryElements(args: { element_type: string }, materials: MaterialInfo[], matches: Record<string, CurrentMatch>): string {
-  if (materials.length === 0) return 'No materials extracted from IFC model.';
+function handleGetModelOverview(context: ModelSummary): string {
+  const { project, materials, storeys, lca } = context;
 
-  let output = '=== Building Materials ===\n\n';
+  let output = `=== MODEL OVERVIEW ===\n\n`;
+  output += `📊 PROJECT: ${project.name}\n`;
+  output += `   Elements: ${project.elementCount.toLocaleString()}\n`;
+  output += `   Buildings: ${project.buildingCount} | Storeys: ${project.storeyCount}\n`;
+  output += `   Total Volume: ${project.totalVolume.toFixed(1)} m³\n\n`;
 
-  const byCategory: Record<string, MaterialInfo[]> = {};
-  materials.forEach(m => {
-    const cat = m.category || 'OTHER';
-    if (!byCategory[cat]) byCategory[cat] = [];
-    byCategory[cat].push(m);
-  });
+  if (lca) {
+    output += `🌍 CURRENT LCA RESULTS:\n`;
+    output += `   Total GWP: ${lca.totalGwp.toLocaleString()} kg CO₂e\n`;
+    output += `   By Category:\n`;
+    for (const [cat, gwp] of Object.entries(lca.gwpByCategory).sort((a, b) => b[1] - a[1])) {
+      output += `     • ${cat}: ${gwp.toLocaleString()} kg CO₂e\n`;
+    }
+    output += '\n';
+  }
 
-  for (const [category, mats] of Object.entries(byCategory)) {
-    output += `📦 ${category}:\n`;
-    for (const mat of mats) {
-      const match = matches[mat.id];
-      output += `  • ${mat.name} (${mat.id})\n`;
-      output += `    Elements: ${mat.elementIds.length}`;
-      if (mat.totalVolume) output += ` | Volume: ${mat.totalVolume.toFixed(2)} m³`;
+  output += `📦 MATERIALS (${materials.length}):\n`;
+  for (const mat of materials.sort((a, b) => (b.currentEpd?.calculatedGwp || 0) - (a.currentEpd?.calculatedGwp || 0))) {
+    output += `\n   ${mat.name} [${mat.id}]\n`;
+    output += `     Category: ${mat.category}\n`;
+    output += `     Elements: ${mat.elementCount}`;
+    if (mat.totalVolume > 0) output += ` | Volume: ${mat.totalVolume.toFixed(2)} m³`;
+    if (mat.totalArea > 0) output += ` | Area: ${mat.totalArea.toFixed(2)} m²`;
+    output += '\n';
+
+    // Element type breakdown
+    const types = Object.entries(mat.elementTypes);
+    if (types.length > 0) {
+      output += `     Used in: ${types.map(([t, c]) => `${t} (${c})`).join(', ')}\n`;
+    }
+
+    if (mat.currentEpd) {
+      output += `     Current EPD: ${mat.currentEpd.name} (${mat.currentEpd.confidence}% conf)\n`;
+      output += `     GWP: ${mat.currentEpd.calculatedGwp.toLocaleString()} kg CO₂e\n`;
+    } else {
+      output += `     ⚠️ No EPD matched\n`;
+    }
+  }
+
+  if (storeys.length > 0) {
+    output += `\n🏢 SPATIAL STRUCTURE:\n`;
+    for (const storey of storeys) {
+      output += `   ${storey.name} (elev: ${storey.elevation}m): ${storey.elementCount} elements\n`;
+    }
+  }
+
+  return output;
+}
+
+function handleGetMaterialDetails(
+  args: { material_id: string },
+  context: ModelSummary,
+  elementDetails?: Record<string, ElementDetail[]>
+): string {
+  const mat = context.materials.find(m => m.id === args.material_id);
+  if (!mat) return `Material "${args.material_id}" not found. Available materials: ${context.materials.map(m => m.id).join(', ')}`;
+
+  let output = `=== ${mat.name} ===\n\n`;
+  output += `ID: ${mat.id}\n`;
+  output += `Category: ${mat.category}\n\n`;
+
+  output += `📏 QUANTITIES:\n`;
+  output += `   Elements: ${mat.elementCount}\n`;
+  if (mat.totalVolume > 0) output += `   Total Volume: ${mat.totalVolume.toFixed(3)} m³\n`;
+  if (mat.totalArea > 0) output += `   Total Area: ${mat.totalArea.toFixed(2)} m²\n`;
+  if (mat.totalWeight) output += `   Total Weight: ${mat.totalWeight.toFixed(1)} kg\n`;
+
+  output += `\n🧱 ELEMENT TYPES:\n`;
+  for (const [type, count] of Object.entries(mat.elementTypes)) {
+    output += `   • ${type}: ${count} elements\n`;
+  }
+
+  if (mat.commonProperties) {
+    output += `\n📋 COMMON PROPERTIES:\n`;
+    if (mat.commonProperties.thicknesses?.length) {
+      output += `   Thicknesses: ${mat.commonProperties.thicknesses.map(t => `${t}mm`).join(', ')}\n`;
+    }
+    if (mat.commonProperties.fireRatings?.length) {
+      output += `   Fire Ratings: ${mat.commonProperties.fireRatings.join(', ')}\n`;
+    }
+    if (mat.commonProperties.strengthClasses?.length) {
+      output += `   Strength Classes: ${mat.commonProperties.strengthClasses.join(', ')}\n`;
+    }
+  }
+
+  if (mat.currentEpd) {
+    output += `\n🏷️ CURRENT EPD:\n`;
+    output += `   Name: ${mat.currentEpd.name}\n`;
+    output += `   ID: ${mat.currentEpd.id}\n`;
+    output += `   GWP: ${mat.currentEpd.gwp} kg CO₂e/unit\n`;
+    output += `   Confidence: ${mat.currentEpd.confidence}%\n`;
+    output += `   Calculated GWP: ${mat.currentEpd.calculatedGwp.toLocaleString()} kg CO₂e\n`;
+  } else {
+    output += `\n⚠️ NO EPD MATCHED - Needs mapping!\n`;
+  }
+
+  // Include sample elements if available
+  const elements = elementDetails?.[mat.id];
+  if (elements && elements.length > 0) {
+    output += `\n📍 SAMPLE ELEMENTS (${Math.min(elements.length, 5)} of ${mat.elementCount}):\n`;
+    for (const elem of elements.slice(0, 5)) {
+      output += `   • ${elem.name} (${elem.type})`;
+      if (elem.storeyName) output += ` @ ${elem.storeyName}`;
+      if (elem.volume) output += ` | ${elem.volume.toFixed(3)} m³`;
       output += '\n';
-      if (match) {
-        output += `    Current EPD: ${match.epdName} (${match.confidence}% conf)\n`;
-        output += `    GWP: ${match.calculatedGWP.toFixed(0)} kg CO₂e\n`;
+      // Show key properties
+      const props = Object.entries(elem.properties).slice(0, 3);
+      if (props.length > 0) {
+        output += `     Properties: ${props.map(([k, v]) => `${k}=${v}`).join(', ')}\n`;
+      }
+    }
+  }
+
+  return output;
+}
+
+function handleGetElementsForMaterial(
+  args: { material_id: string; limit?: number },
+  context: ModelSummary,
+  elementDetails?: Record<string, ElementDetail[]>
+): string {
+  const mat = context.materials.find(m => m.id === args.material_id);
+  if (!mat) return `Material "${args.material_id}" not found.`;
+
+  const limit = args.limit || 20;
+  const elements = elementDetails?.[mat.id] || [];
+
+  if (elements.length === 0) {
+    return `No element details available for "${mat.name}". Material has ${mat.elementCount} elements of types: ${Object.keys(mat.elementTypes).join(', ')}`;
+  }
+
+  let output = `=== ELEMENTS FOR ${mat.name} ===\n`;
+  output += `Showing ${Math.min(elements.length, limit)} of ${mat.elementCount} elements\n\n`;
+
+  for (const elem of elements.slice(0, limit)) {
+    output += `[${elem.id}] ${elem.name}\n`;
+    output += `  Type: ${elem.type}\n`;
+    if (elem.storeyName) output += `  Location: ${elem.storeyName}\n`;
+    if (elem.volume) output += `  Volume: ${elem.volume.toFixed(4)} m³\n`;
+    if (elem.area) output += `  Area: ${elem.area.toFixed(2)} m²\n`;
+
+    const props = Object.entries(elem.properties);
+    if (props.length > 0) {
+      output += `  Properties:\n`;
+      for (const [key, value] of props.slice(0, 8)) {
+        output += `    • ${key}: ${value}\n`;
       }
     }
     output += '\n';
@@ -256,79 +518,238 @@ function handleQueryElements(args: { element_type: string }, materials: Material
   return output;
 }
 
-function handleSearchEPD(args: { category?: string; gwp_max?: number; fire_rating_min?: string; use_case?: string; suitable_for?: string; recycled_content_min?: number }): string {
-  const results = Object.values(mockEPDs).filter(epd => {
-    if (args.category && epd.category !== args.category) return false;
-    if (args.gwp_max && epd.gwp > args.gwp_max) return false;
-    if (args.use_case && !epd.use_cases.includes(args.use_case)) return false;
-    if (args.suitable_for && !epd.suitable_for.includes(args.suitable_for)) return false;
-    if (args.recycled_content_min && (epd.recycled_content || 0) < args.recycled_content_min) return false;
-    return true;
-  }).sort((a, b) => a.gwp - b.gwp);
+function handleGetSpatialBreakdown(
+  args: { storey_name?: string },
+  context: ModelSummary
+): string {
+  let storeys = context.storeys;
 
-  if (results.length === 0) return 'No EPDs found matching criteria.';
+  if (args.storey_name) {
+    const query = args.storey_name.toLowerCase();
+    storeys = storeys.filter(s => s.name.toLowerCase().includes(query));
+  }
 
-  return results.map((epd, i) =>
-    `${i + 1}. [${epd.id}] ${epd.name}\n   GWP: ${epd.gwp} kg CO₂e/${epd.unit}${epd.fire_rating ? ` | Fire: ${epd.fire_rating}` : ''}${epd.recycled_content ? ` | Recycled: ${epd.recycled_content}%` : ''}`
-  ).join('\n\n');
+  if (storeys.length === 0) {
+    return `No storeys found${args.storey_name ? ` matching "${args.storey_name}"` : ''}. Available storeys: ${context.storeys.map(s => s.name).join(', ')}`;
+  }
+
+  let output = `=== SPATIAL BREAKDOWN ===\n\n`;
+
+  for (const storey of storeys) {
+    output += `🏢 ${storey.name}\n`;
+    output += `   Elevation: ${storey.elevation}m\n`;
+    output += `   Total Elements: ${storey.elementCount}\n`;
+    output += `   Materials:\n`;
+
+    for (const [matName, count] of Object.entries(storey.materialBreakdown).sort((a, b) => b[1] - a[1])) {
+      output += `     • ${matName}: ${count} elements\n`;
+    }
+    output += '\n';
+  }
+
+  return output;
+}
+
+function handleGetHighImpactElements(
+  args: { limit?: number },
+  context: ModelSummary
+): string {
+  const limit = args.limit || 10;
+
+  // Calculate impact per material
+  const impacts = context.materials
+    .filter(m => m.currentEpd)
+    .map(m => ({
+      material: m,
+      gwpPerElement: m.currentEpd!.calculatedGwp / m.elementCount,
+      totalGwp: m.currentEpd!.calculatedGwp,
+    }))
+    .sort((a, b) => b.totalGwp - a.totalGwp);
+
+  let output = `=== HIGH IMPACT ANALYSIS ===\n\n`;
+
+  if (impacts.length === 0) {
+    return 'No materials with EPD matches found for impact analysis.';
+  }
+
+  output += `📊 MATERIALS BY TOTAL GWP IMPACT:\n\n`;
+
+  for (const item of impacts.slice(0, limit)) {
+    const mat = item.material;
+    const pct = context.lca ? ((item.totalGwp / context.lca.totalGwp) * 100).toFixed(1) : '?';
+
+    output += `${mat.name}\n`;
+    output += `  Total GWP: ${item.totalGwp.toLocaleString()} kg CO₂e (${pct}% of total)\n`;
+    output += `  Elements: ${mat.elementCount} | Volume: ${mat.totalVolume.toFixed(2)} m³\n`;
+    output += `  Current EPD: ${mat.currentEpd!.name}\n`;
+    output += `  EPD GWP: ${mat.currentEpd!.gwp} kg CO₂e/unit\n`;
+    output += '\n';
+  }
+
+  output += `💡 OPTIMIZATION TIP: Focus on the top materials for maximum carbon reduction.\n`;
+
+  return output;
+}
+
+function handleSearchEPD(args: {
+  category?: string;
+  gwp_max?: number;
+  keywords?: string[];
+  use_case?: string;
+  suitable_for?: string;
+  recycled_content_min?: number;
+}): string {
+  let results = Object.values(mockEPDs);
+
+  // Apply filters
+  if (args.category) {
+    results = results.filter(e => e.category === args.category);
+  }
+  if (args.gwp_max !== undefined) {
+    results = results.filter(e => e.gwp <= args.gwp_max!);
+  }
+  if (args.use_case) {
+    results = results.filter(e => e.use_cases.includes(args.use_case!));
+  }
+  if (args.suitable_for) {
+    results = results.filter(e => e.suitable_for.includes(args.suitable_for!));
+  }
+  if (args.recycled_content_min !== undefined) {
+    results = results.filter(e => (e.recycled_content || 0) >= args.recycled_content_min!);
+  }
+  if (args.keywords && args.keywords.length > 0) {
+    const lowerKeywords = args.keywords.map(k => k.toLowerCase());
+    results = results.filter(e =>
+      lowerKeywords.some(kw =>
+        e.keywords.some(ek => ek.includes(kw)) ||
+        e.name.toLowerCase().includes(kw)
+      )
+    );
+  }
+
+  // Sort by GWP (lowest first)
+  results.sort((a, b) => a.gwp - b.gwp);
+
+  if (results.length === 0) {
+    return 'No EPDs found matching the criteria. Try broadening your search.';
+  }
+
+  let output = `=== EPD SEARCH RESULTS (${results.length}) ===\n\n`;
+
+  for (const epd of results) {
+    output += `[${epd.id}] ${epd.name}\n`;
+    output += `  GWP: ${epd.gwp} kg CO₂e/${epd.unit}\n`;
+    output += `  Category: ${epd.category}\n`;
+    if (epd.fire_rating) output += `  Fire Rating: ${epd.fire_rating}\n`;
+    if (epd.recycled_content) output += `  Recycled Content: ${epd.recycled_content}%\n`;
+    output += `  Suitable for: ${epd.suitable_for.join(', ')}\n`;
+    output += '\n';
+  }
+
+  return output;
 }
 
 function handleGetEPD(args: { epd_id: string }): string {
   const epd = mockEPDs[args.epd_id];
-  if (!epd) return `EPD "${args.epd_id}" not found.`;
+  if (!epd) return `EPD "${args.epd_id}" not found. Try searching with search_epd_database.`;
 
   return `=== ${epd.name} ===
 ID: ${epd.id}
 Category: ${epd.category}
-GWP: ${epd.gwp} kg CO₂e/${epd.unit}
-${epd.fire_rating ? `Fire Rating: ${epd.fire_rating}` : ''}
-${epd.recycled_content ? `Recycled Content: ${epd.recycled_content}%` : ''}
-Use Cases: ${epd.use_cases.join(', ')}
-Suitable For: ${epd.suitable_for.join(', ')}`;
+
+ENVIRONMENTAL IMPACT:
+  GWP (A1-A3): ${epd.gwp} kg CO₂e/${epd.unit}
+
+TECHNICAL PROPERTIES:
+${epd.fire_rating ? `  Fire Rating: ${epd.fire_rating}` : '  Fire Rating: Not specified'}
+${epd.recycled_content ? `  Recycled Content: ${epd.recycled_content}%` : '  Recycled Content: Not specified'}
+
+USE CASES: ${epd.use_cases.join(', ')}
+SUITABLE FOR: ${epd.suitable_for.join(', ')}
+KEYWORDS: ${epd.keywords.join(', ')}`;
 }
 
 function handleCompare(args: { epd_ids: string[] }): string {
   const epds = args.epd_ids.map(id => mockEPDs[id]).filter(Boolean);
-  if (epds.length < 2) return 'Need at least 2 valid EPDs to compare.';
+  if (epds.length < 2) return 'Need at least 2 valid EPD IDs to compare.';
 
-  let output = '=== EPD Comparison ===\n\n';
-  output += 'Property'.padEnd(25) + epds.map(e => e.name.substring(0, 20)).join(' | ') + '\n';
-  output += '-'.repeat(25 + epds.length * 23) + '\n';
-  output += 'GWP (kg CO₂e)'.padEnd(25) + epds.map(e => String(e.gwp).padEnd(20)).join(' | ') + '\n';
-  output += 'Unit'.padEnd(25) + epds.map(e => e.unit.padEnd(20)).join(' | ') + '\n';
-  output += 'Fire Rating'.padEnd(25) + epds.map(e => (e.fire_rating || 'N/A').padEnd(20)).join(' | ') + '\n';
-  output += 'Recycled %'.padEnd(25) + epds.map(e => String(e.recycled_content || 0).padEnd(20)).join(' | ') + '\n';
+  let output = '=== EPD COMPARISON ===\n\n';
 
+  // Header
+  output += 'Property'.padEnd(22);
+  for (const epd of epds) {
+    output += epd.name.substring(0, 25).padEnd(28);
+  }
+  output += '\n' + '-'.repeat(22 + epds.length * 28) + '\n';
+
+  // GWP
+  output += 'GWP (kg CO₂e)'.padEnd(22);
+  for (const epd of epds) {
+    output += `${epd.gwp} /${epd.unit}`.padEnd(28);
+  }
+  output += '\n';
+
+  // Fire Rating
+  output += 'Fire Rating'.padEnd(22);
+  for (const epd of epds) {
+    output += (epd.fire_rating || '-').padEnd(28);
+  }
+  output += '\n';
+
+  // Recycled Content
+  output += 'Recycled %'.padEnd(22);
+  for (const epd of epds) {
+    output += `${epd.recycled_content || 0}%`.padEnd(28);
+  }
+  output += '\n';
+
+  // Suitable For
+  output += 'Suitable For'.padEnd(22);
+  for (const epd of epds) {
+    output += epd.suitable_for.slice(0, 3).join(', ').padEnd(28);
+  }
+  output += '\n\n';
+
+  // Recommendation
   const lowest = epds.reduce((min, e) => e.gwp < min.gwp ? e : min);
-  output += `\n💡 Lowest GWP: ${lowest.name} (${lowest.gwp} kg CO₂e/${lowest.unit})`;
+  const highest = epds.reduce((max, e) => e.gwp > max.gwp ? e : max);
+  const savings = ((highest.gwp - lowest.gwp) / highest.gwp * 100).toFixed(0);
+
+  output += `💡 LOWEST GWP: ${lowest.name} (${lowest.gwp} kg CO₂e/${lowest.unit})\n`;
+  output += `   Potential reduction: ${savings}% compared to highest option\n`;
 
   return output;
 }
 
 function handleProposal(
   args: { material_id: string; proposed_epd_id: string; confidence: number; reasoning: string; key_benefits?: string[] },
-  materials: MaterialInfo[],
-  matches: Record<string, CurrentMatch>
+  context: ModelSummary
 ): { result: string; proposal?: EPDProposal } {
-  const material = materials.find(m => m.id === args.material_id);
-  if (!material) return { result: `Material "${args.material_id}" not found.` };
+  const mat = context.materials.find(m => m.id === args.material_id);
+  if (!mat) return { result: `Material "${args.material_id}" not found.` };
 
   const epd = mockEPDs[args.proposed_epd_id];
   if (!epd) return { result: `EPD "${args.proposed_epd_id}" not found.` };
 
-  const currentMatch = matches[args.material_id];
-  const quantity = material.totalVolume || material.totalArea || 1;
+  // Calculate GWP based on unit
+  let quantity = mat.totalVolume;
+  if (epd.unit === 'kg') {
+    quantity = mat.totalWeight || mat.totalVolume * 2400; // Default density for concrete
+  } else if (epd.unit === 'm2') {
+    quantity = mat.totalArea;
+  }
+
   const proposedGWP = epd.gwp * quantity;
-  const currentGWP = currentMatch?.calculatedGWP || 0;
+  const currentGWP = mat.currentEpd?.calculatedGwp || 0;
   const gwpDiff = proposedGWP - currentGWP;
   const gwpDiffPercent = currentGWP > 0 ? (gwpDiff / currentGWP) * 100 : 0;
 
   const proposal: EPDProposal = {
-    id: `proposal-${Date.now()}`,
+    id: `proposal-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
     material_id: args.material_id,
-    material_name: material.name,
-    current_epd_id: currentMatch?.epdId,
-    current_epd_name: currentMatch?.epdName,
+    material_name: mat.name,
+    current_epd_id: mat.currentEpd?.id,
+    current_epd_name: mat.currentEpd?.name,
     current_gwp: currentGWP,
     proposed_epd_id: args.proposed_epd_id,
     proposed_epd_name: epd.name,
@@ -341,8 +762,11 @@ function handleProposal(
     status: 'pending',
   };
 
+  const emoji = gwpDiff < 0 ? '✅' : gwpDiff > 0 ? '⚠️' : '➡️';
+  const direction = gwpDiff < 0 ? 'reduction' : gwpDiff > 0 ? 'increase' : 'no change';
+
   return {
-    result: `✅ Proposal created for "${material.name}"\nProposed: ${epd.name}\nGWP change: ${gwpDiff >= 0 ? '+' : ''}${gwpDiff.toFixed(0)} kg CO₂e (${gwpDiffPercent >= 0 ? '+' : ''}${gwpDiffPercent.toFixed(1)}%)`,
+    result: `${emoji} PROPOSAL CREATED\n\nMaterial: ${mat.name}\nProposed EPD: ${epd.name}\nGWP Change: ${gwpDiff >= 0 ? '+' : ''}${gwpDiff.toFixed(0)} kg CO₂e (${gwpDiffPercent >= 0 ? '+' : ''}${gwpDiffPercent.toFixed(1)}% ${direction})\n\nThe proposal has been created for user review.`,
     proposal,
   };
 }
@@ -350,26 +774,31 @@ function handleProposal(
 function executeToolCall(
   toolName: string,
   args: Record<string, unknown>,
-  materials: MaterialInfo[],
-  matches: Record<string, CurrentMatch>
+  context: ModelSummary,
+  elementDetails?: Record<string, ElementDetail[]>
 ): { result: string; proposal?: EPDProposal } {
   switch (toolName) {
-    case 'query_building_elements':
-      return { result: handleQueryElements(args as { element_type: string }, materials, matches) };
-    case 'get_material_details': {
-      const mat = materials.find(m => m.id === (args as { material_id: string }).material_id);
-      if (!mat) return { result: `Material not found.` };
-      const match = matches[mat.id];
-      return { result: `${mat.name} (${mat.category})\nElements: ${mat.elementIds.length}\n${mat.totalVolume ? `Volume: ${mat.totalVolume.toFixed(2)} m³\n` : ''}${match ? `Current EPD: ${match.epdName}\nGWP: ${match.calculatedGWP.toFixed(0)} kg CO₂e` : 'No EPD matched'}` };
-    }
+    case 'get_model_overview':
+      return { result: handleGetModelOverview(context) };
+    case 'get_material_details':
+      return { result: handleGetMaterialDetails(args as { material_id: string }, context, elementDetails) };
+    case 'get_elements_for_material':
+      return { result: handleGetElementsForMaterial(args as { material_id: string; limit?: number }, context, elementDetails) };
+    case 'get_spatial_breakdown':
+      return { result: handleGetSpatialBreakdown(args as { storey_name?: string }, context) };
+    case 'get_high_impact_elements':
+      return { result: handleGetHighImpactElements(args as { limit?: number }, context) };
     case 'search_epd_database':
-      return { result: handleSearchEPD(args as { category?: string }) };
+      return { result: handleSearchEPD(args as { category?: string; gwp_max?: number }) };
     case 'get_epd_details':
       return { result: handleGetEPD(args as { epd_id: string }) };
     case 'compare_epds':
       return { result: handleCompare(args as { epd_ids: string[] }) };
     case 'propose_epd_mapping':
-      return handleProposal(args as { material_id: string; proposed_epd_id: string; confidence: number; reasoning: string }, materials, matches);
+      return handleProposal(
+        args as { material_id: string; proposed_epd_id: string; confidence: number; reasoning: string; key_benefits?: string[] },
+        context
+      );
     default:
       return { result: `Unknown tool: ${toolName}` };
   }
@@ -377,28 +806,38 @@ function executeToolCall(
 
 // ============ System Prompt ============
 
-const systemPrompt = `You are an expert EPD (Environmental Product Declaration) matching agent for building Life Cycle Assessment.
+const systemPrompt = `You are an expert EPD (Environmental Product Declaration) matching agent for building Life Cycle Assessment (LCA).
 
-Your role is to help users find the most appropriate EPDs for their building materials by:
-1. Understanding the building's materials and their properties
-2. Searching the EPD database with specific technical criteria
-3. Comparing options and recommending the best matches
-4. Creating proposals for improved EPD mappings
+You have FULL ACCESS to the building model data through your tools:
+- Project information (element counts, spatial structure, total volumes)
+- All materials with quantities, element types, and properties
+- Current EPD mappings with GWP values
+- Spatial breakdown by building storey
+- Individual element details when needed
+
+YOUR ROLE:
+1. Analyze the building model to understand materials and their usage
+2. Identify opportunities for carbon reduction through better EPD choices
+3. Search the EPD database with appropriate technical criteria
+4. Propose EPD mappings with detailed, context-aware reasoning
+
+WORKFLOW FOR EPD OPTIMIZATION:
+1. Start with get_model_overview to understand the building
+2. Use get_high_impact_elements to prioritize materials by GWP contribution
+3. For each priority material, use get_material_details to understand usage context
+4. Search for better EPDs with search_epd_database using appropriate filters
+5. Compare options with compare_epds
+6. Create proposals with propose_epd_mapping, explaining why the EPD fits
 
 IMPORTANT GUIDELINES:
-- Always start by querying the building elements to understand what materials exist
-- Consider technical requirements like fire rating, strength class, etc.
-- Prioritize lower GWP options when they meet technical requirements
-- Explain your reasoning clearly when making proposals
-- Create proposals using propose_epd_mapping for each recommended change
+- Always consider ELEMENT TYPES when selecting EPDs (e.g., structural concrete for slabs/columns)
+- Check if materials are used in walls, slabs, beams, etc. to select appropriate EPDs
+- Consider fire ratings and structural requirements mentioned in properties
+- Prioritize lower GWP options that still meet technical requirements
+- Explain your reasoning clearly, referencing specific element types and quantities
+- Create concrete proposals for the user to accept/reject
 
-When the user asks to "match EPDs" or "find better EPDs":
-1. First query_building_elements to see all materials
-2. For each material, search_epd_database with appropriate criteria
-3. Compare top options if needed
-4. Create propose_epd_mapping for your recommendations
-
-Be concise but thorough. Focus on actionable recommendations.`;
+Be thorough but efficient. Focus on actionable recommendations that reduce carbon.`;
 
 // ============ Main Handler ============
 
@@ -427,15 +866,27 @@ export default async function handler(req: Request) {
 
   try {
     const body: AgentRequest = await req.json();
-    const { message, materials, currentMatches, buildingInfo, conversationHistory = [] } = body;
+    const { message, modelContext, elementDetails, conversationHistory = [] } = body;
 
     // Build context summary for system prompt
-    let contextSummary = '';
-    if (materials.length > 0) {
-      contextSummary = `\n\nCurrent building has ${materials.length} materials:\n`;
-      contextSummary += materials.map(m =>
-        `- ${m.name} (${m.category}): ${m.elementIds.length} elements${m.totalVolume ? `, ${m.totalVolume.toFixed(1)} m³` : ''}`
-      ).join('\n');
+    let contextSummary = '\n\n--- CURRENT MODEL ---\n';
+    contextSummary += `Project: ${modelContext.project.name}\n`;
+    contextSummary += `Elements: ${modelContext.project.elementCount} | Volume: ${modelContext.project.totalVolume.toFixed(1)} m³\n`;
+    contextSummary += `Materials: ${modelContext.materials.length}\n`;
+
+    if (modelContext.lca) {
+      contextSummary += `Total GWP: ${modelContext.lca.totalGwp.toLocaleString()} kg CO₂e\n`;
+    }
+
+    contextSummary += '\nMaterials summary:\n';
+    for (const mat of modelContext.materials.slice(0, 10)) {
+      contextSummary += `- ${mat.name}: ${mat.elementCount} elements, ${mat.totalVolume.toFixed(1)} m³`;
+      if (mat.currentEpd) {
+        contextSummary += ` → ${mat.currentEpd.name} (${mat.currentEpd.calculatedGwp.toFixed(0)} kg CO₂e)`;
+      } else {
+        contextSummary += ' → NO EPD';
+      }
+      contextSummary += '\n';
     }
 
     const messages: Array<{ role: string; content: string; tool_call_id?: string; tool_calls?: ToolCall[] }> = [
@@ -447,8 +898,8 @@ export default async function handler(req: Request) {
     const proposals: EPDProposal[] = [];
     const toolResults: Array<{ tool: string; result: string }> = [];
 
-    // Agent loop - max 5 iterations
-    for (let i = 0; i < 5; i++) {
+    // Agent loop - max 8 iterations for thorough analysis
+    for (let i = 0; i < 8; i++) {
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -485,18 +936,16 @@ export default async function handler(req: Request) {
       const choice = data.choices[0];
       const assistantMessage = choice.message;
 
-      // Add assistant message to history
       messages.push(assistantMessage as { role: string; content: string; tool_calls?: ToolCall[] });
 
-      // Check if we need to execute tools
       if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
         for (const toolCall of assistantMessage.tool_calls) {
           const toolName = toolCall.function.name;
           const toolArgs = JSON.parse(toolCall.function.arguments);
 
-          console.log(`[Agent] Executing tool: ${toolName}`, toolArgs);
+          console.log(`[Agent] Tool: ${toolName}`, toolArgs);
 
-          const { result, proposal } = executeToolCall(toolName, toolArgs, materials, currentMatches);
+          const { result, proposal } = executeToolCall(toolName, toolArgs, modelContext, elementDetails);
 
           if (proposal) {
             proposals.push(proposal);
@@ -504,7 +953,6 @@ export default async function handler(req: Request) {
 
           toolResults.push({ tool: toolName, result });
 
-          // Add tool result to messages
           messages.push({
             role: 'tool',
             tool_call_id: toolCall.id,
@@ -512,12 +960,12 @@ export default async function handler(req: Request) {
           });
         }
       } else {
-        // No more tool calls, we have the final response
+        // No more tool calls - return final response
         return new Response(JSON.stringify({
           response: assistantMessage.content,
           proposals,
           toolResults,
-          conversationHistory: messages.slice(1), // Exclude system prompt
+          conversationHistory: messages.slice(1),
         }), {
           headers: {
             'Content-Type': 'application/json',
@@ -529,7 +977,7 @@ export default async function handler(req: Request) {
 
     // Max iterations reached
     return new Response(JSON.stringify({
-      response: 'I\'ve analyzed the building and created my recommendations. Please review the proposals above.',
+      response: 'I\'ve completed my analysis and created recommendations. Please review the proposals above.',
       proposals,
       toolResults,
     }), {

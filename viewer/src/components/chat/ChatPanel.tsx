@@ -2,9 +2,15 @@
  * EPD Assistant Chat Panel
  * AI-powered EPD mapping assistant with full model context
  * Helps users find better EPD matches for their building materials
+ *
+ * Uses rich model context including:
+ * - Project info (element counts, spatial structure)
+ * - Materials with element type breakdowns and quantities
+ * - Current EPD mappings with GWP values
+ * - Element details for specific materials
  */
 
-import React, { useRef, useEffect, useState, FormEvent, useCallback } from 'react';
+import React, { useRef, useEffect, useState, FormEvent, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { useViewerStore } from '../../store';
 import { ScrollArea } from '../ui/scroll-area';
@@ -12,6 +18,7 @@ import { Button } from '../ui/button';
 import { Send, Bot, User, Loader2, AlertCircle, Copy, Check, Wand2, Leaf, Search, BarChart3 } from 'lucide-react';
 import { EPDProposalsList } from './EPDProposalCard';
 import type { EPDProposal } from '../../store/slices/lcaSlice';
+import { buildModelSummary, getElementsForMaterial, type ModelSummary, type ElementDetail } from '../../lib/model-context';
 
 /** EPD Agent API endpoint */
 const AGENT_API_ENDPOINT = import.meta.env.DEV
@@ -205,6 +212,8 @@ export function ChatPanel() {
 
   // Model context
   const lcaResults = useViewerStore((s) => s.lcaResults);
+  const extractedMaterials = useViewerStore((s) => s.extractedMaterials);
+  const getAllVisibleModels = useViewerStore((s) => s.getAllVisibleModels);
 
   // Local input state
   const [input, setInput] = useState('');
@@ -219,44 +228,32 @@ export function ChatPanel() {
     }
   }, [chatMessages]);
 
-  // Build full model context for the agent
-  const buildModelContext = useCallback(() => {
-    if (!lcaResults) return { materials: [], currentMatches: {} };
+  // Build rich model context with full material/element details
+  // Memoized to avoid rebuilding on every render
+  const modelContext = useMemo((): { summary: ModelSummary; elementDetails: Record<string, ElementDetail[]> } | null => {
+    if (!lcaResults || extractedMaterials.length === 0) return null;
 
-    const materials = lcaResults.matches.map(m => ({
-      id: m.material.id,
-      name: m.material.name,
-      category: m.material.category,
-      elementIds: m.material.elementIds,
-      totalVolume: m.material.totalVolume,
-      totalArea: m.material.totalArea,
-      properties: m.material.properties,
-    }));
+    const models = getAllVisibleModels();
+    if (models.length === 0) return null;
 
-    const currentMatches: Record<string, {
-      epdId: string;
-      epdName: string;
-      confidence: number;
-      gwp: number;
-      calculatedGWP: number;
-    }> = {};
+    // Build the model summary with full context
+    const summary = buildModelSummary(models, extractedMaterials, lcaResults);
 
-    lcaResults.matches.forEach(m => {
-      currentMatches[m.material.id] = {
-        epdId: m.epd.id,
-        epdName: m.epd.name,
-        confidence: m.confidence,
-        gwp: m.epd.impacts.gwp,
-        calculatedGWP: m.calculatedGWP,
-      };
-    });
+    // Pre-fetch element details for each material (limited to 20 per material)
+    const elementDetails: Record<string, ElementDetail[]> = {};
+    for (const material of extractedMaterials) {
+      const details = getElementsForMaterial(models, material.id, extractedMaterials, undefined, 20);
+      if (details.length > 0) {
+        elementDetails[material.id] = details;
+      }
+    }
 
-    return { materials, currentMatches };
-  }, [lcaResults]);
+    return { summary, elementDetails };
+  }, [lcaResults, extractedMaterials, getAllVisibleModels]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isChatLoading || isAgentProcessing) return;
+    if (!input.trim() || isChatLoading || isAgentProcessing || !modelContext) return;
 
     const userMessage = input.trim();
     setInput('');
@@ -268,16 +265,14 @@ export function ChatPanel() {
     addChatMessage({ role: 'user', content: userMessage });
 
     try {
-      // Always use the EPD agent with full model context
-      const { materials, currentMatches } = buildModelContext();
-
+      // Send rich model context to the EPD agent
       const response = await fetch(AGENT_API_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: userMessage,
-          materials,
-          currentMatches,
+          modelContext: modelContext.summary,
+          elementDetails: modelContext.elementDetails,
           conversationHistory: chatMessages.slice(-6).map(m => ({
             role: m.role,
             content: m.content
@@ -329,7 +324,7 @@ export function ChatPanel() {
     }
   };
 
-  if (!lcaResults) {
+  if (!modelContext) {
     return (
       <div className="h-full flex flex-col items-center justify-center p-4 text-center text-muted-foreground">
         <Wand2 className="w-8 h-8 mb-2 opacity-50" />
@@ -345,7 +340,7 @@ export function ChatPanel() {
         <Wand2 className="w-4 h-4 text-primary" />
         <span className="text-xs font-medium">EPD Assistant</span>
         <span className="text-xs text-muted-foreground">
-          • {lcaResults.matches.length} materials loaded
+          • {modelContext.summary.materials.length} materials | {modelContext.summary.project.elementCount.toLocaleString()} elements
         </span>
       </div>
 
