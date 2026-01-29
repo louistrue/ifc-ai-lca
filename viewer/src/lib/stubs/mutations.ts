@@ -27,6 +27,14 @@ export class MutablePropertyView {
   hasChanges() { return false; }
   getChanges() { return []; }
   clearChanges() {}
+  getMutations() { return []; }
+  getMutationsForEntity(_entityId: number) { return []; }
+  getModifiedEntityIds() { return []; }
+  applyMutation(_mutation: unknown) { return null; }
+  undo() { return null; }
+  redo() { return null; }
+  canUndo() { return false; }
+  canRedo() { return false; }
 }
 
 export class BulkQueryEngine {
