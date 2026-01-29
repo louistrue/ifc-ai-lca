@@ -59,13 +59,15 @@ export function ChatPanel() {
 
   // Get LCA context from store
   const lcaResults = useViewerStore((s) => s.lcaResults);
+  const matchingMethod = useViewerStore((s) => s.matchingMethod);
 
-  // Build context for the AI
+  // Build context for the AI - include matching method for better responses
   const lcaContext = lcaResults
     ? {
         totalGWP: lcaResults.totalGWP,
         matchedCount: lcaResults.matches.length,
         unmatchedCount: lcaResults.unmatchedMaterials.length,
+        matchingMethod: matchingMethod,
         materials: lcaResults.matches.map((m) => ({
           name: m.material.name,
           category: m.material.category,
@@ -75,6 +77,7 @@ export function ChatPanel() {
           quantity: m.quantity,
           unit: m.calculatedUnit,
           elementCount: m.material.elementIds.length,
+          matchReason: m.matchReason,
           alternatives: m.alternatives?.map((a) => ({
             name: a.name,
             gwp: a.impacts.gwp,

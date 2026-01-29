@@ -1,23 +1,16 @@
 /**
- * API Server for AI Chat
- * Simple Express server that handles chat requests using Vercel AI SDK
+ * API Server for AI Chat and EPD Mapping
+ * Simple Express server that handles AI requests using direct OpenAI API
  */
 
 import express from 'express';
 import cors from 'cors';
-import { streamText } from 'ai';
-import { createOpenAI } from '@ai-sdk/openai';
 
 const app = express();
 const PORT = process.env.API_PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
-
-// Create OpenAI provider - will use OPENAI_API_KEY from environment
-const openai = createOpenAI({
-  apiKey: process.env.OPENAI_API_KEY || '',
-});
 
 // System prompt for LCA analysis
 const systemPrompt = `You are an expert Life Cycle Assessment (LCA) assistant for buildings.
@@ -32,14 +25,36 @@ Key behaviors:
 - Keep responses concise but informative
 - When discussing materials, mention their matched EPD confidence level
 - Negative GWP values indicate carbon-storing materials (like wood)
+- Note if AI-powered EPD matching was used (higher accuracy) vs algorithmic matching
 
 You will receive context about the building's materials, their quantities, matched EPDs,
 and calculated environmental impacts. Use this context to provide accurate, specific advice.`;
 
-// Chat endpoint
+// Chat endpoint - uses direct OpenAI API with streaming
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages, context } = req.body;
+    const { messages, context } = req.body as {
+      messages: { role: 'user' | 'assistant'; content: string }[];
+      context: {
+        totalGWP?: number;
+        matchedCount?: number;
+        unmatchedCount?: number;
+        matchingMethod?: 'llm' | 'algorithmic' | 'none';
+        materials?: Array<{
+          name: string;
+          category: string;
+          gwp: number;
+          confidence: number;
+          epd: string;
+          quantity: number;
+          unit: string;
+          elementCount: number;
+          matchReason?: string;
+          alternatives?: { name: string; gwp: number }[];
+        }>;
+        byCategory?: Record<string, number>;
+      } | null;
+    };
 
     if (!process.env.OPENAI_API_KEY) {
       res.status(401).json({ error: 'API key not configured. Set OPENAI_API_KEY environment variable.' });
@@ -49,24 +64,20 @@ app.post('/api/chat', async (req, res) => {
     // Build context message
     let contextMessage = '';
     if (context) {
+      const matchingInfo = context.matchingMethod === 'llm'
+        ? '(AI-powered matching with GPT-4o-mini)'
+        : context.matchingMethod === 'algorithmic'
+        ? '(algorithmic keyword matching)'
+        : '';
+
       contextMessage = `
-Current Building Analysis:
+Current Building Analysis ${matchingInfo}:
 - Total GWP: ${context.totalGWP?.toFixed(0) || 0} kg CO₂e
 - Matched materials: ${context.matchedCount || 0}
 - Unmatched materials: ${context.unmatchedCount || 0}
 
 Materials breakdown:
-${context.materials?.map((m: {
-  name: string;
-  category: string;
-  gwp: number;
-  confidence: number;
-  epd: string;
-  quantity: number;
-  unit: string;
-  elementCount: number;
-  alternatives?: { name: string; gwp: number }[];
-}) => `- ${m.name} (${m.category}): ${m.gwp?.toFixed(0) || 0} kg CO₂e, ${m.quantity?.toFixed(2) || 0} ${m.unit}, ${m.confidence}% confidence match to "${m.epd}", ${m.elementCount} elements${m.alternatives?.length ? `, alternatives: ${m.alternatives.map(a => `${a.name} (${a.gwp} kg CO₂e)`).join(', ')}` : ''}`).join('\n') || 'No materials extracted yet.'}
+${context.materials?.map((m) => `- ${m.name} (${m.category}): ${m.gwp?.toFixed(0) || 0} kg CO₂e, ${m.quantity?.toFixed(2) || 0} ${m.unit}, ${m.confidence}% confidence match to "${m.epd}", ${m.elementCount} elements${m.matchReason ? ` [${m.matchReason}]` : ''}${m.alternatives?.length ? `, alternatives: ${m.alternatives.map(a => `${a.name} (${a.gwp} kg CO₂e)`).join(', ')}` : ''}`).join('\n') || 'No materials extracted yet.'}
 
 By category:
 ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp as number).toFixed(0)} kg CO₂e`).join('\n') || 'No category data.'}
@@ -79,37 +90,79 @@ ${Object.entries(context.byCategory || {}).map(([cat, gwp]) => `- ${cat}: ${(gwp
       ...messages,
     ];
 
-    // Stream the response
-    const result = streamText({
-      model: openai('gpt-4o-mini'),
-      messages: allMessages,
+    // Use direct OpenAI API with streaming
+    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: allMessages,
+        stream: true,
+      }),
     });
+
+    if (!openaiResponse.ok) {
+      const errorText = await openaiResponse.text();
+      console.error('OpenAI API error:', errorText);
+      res.status(500).json({ error: 'AI service error', details: errorText });
+      return;
+    }
 
     // Set headers for streaming
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // Stream chunks to client
-    const stream = result.toDataStream();
-    const reader = stream.getReader();
+    // Stream and transform chunks to client
+    const reader = openaiResponse.body?.getReader();
+    if (!reader) {
+      res.status(500).json({ error: 'No response body from OpenAI' });
+      return;
+    }
 
-    const sendChunk = async () => {
+    const decoder = new TextDecoder();
+
+    const processStream = async () => {
       try {
-        const { done, value } = await reader.read();
-        if (done) {
-          res.end();
-          return;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            res.end();
+            return;
+          }
+
+          const text = decoder.decode(value);
+          const lines = text.split('\n').filter(line => line.trim() !== '');
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') {
+                continue;
+              }
+              try {
+                const parsed = JSON.parse(data);
+                const content = parsed.choices?.[0]?.delta?.content;
+                if (content) {
+                  // Format as Vercel AI SDK stream format
+                  res.write(`0:${JSON.stringify(content)}\n`);
+                }
+              } catch {
+                // Skip parse errors
+              }
+            }
+          }
         }
-        res.write(new TextDecoder().decode(value));
-        sendChunk();
       } catch (err) {
         console.error('Stream error:', err);
         res.end();
       }
     };
 
-    sendChunk();
+    processStream();
   } catch (error) {
     console.error('Chat API error:', error);
     res.status(500).json({ error: 'Internal server error' });
