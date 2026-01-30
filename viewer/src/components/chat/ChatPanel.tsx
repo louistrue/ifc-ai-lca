@@ -212,10 +212,13 @@ export function ChatPanel() {
   const isAgentProcessing = useViewerStore((s) => s.isAgentProcessing);
 
   // Model context - subscribe to actual models data, not just the function
+  // Also get legacy single-model state for backward compatibility
   const lcaResults = useViewerStore((s) => s.lcaResults);
   const extractedMaterials = useViewerStore((s) => s.extractedMaterials);
   const models = useViewerStore((s) => s.models); // Subscribe to models map for reactivity
   const getAllVisibleModels = useViewerStore((s) => s.getAllVisibleModels);
+  const ifcDataStore = useViewerStore((s) => s.ifcDataStore); // Legacy single-file state
+  const geometryResult = useViewerStore((s) => s.geometryResult); // Legacy single-file state
 
   // Local input state
   const [input, setInput] = useState('');
@@ -237,18 +240,38 @@ export function ChatPanel() {
   // - Grouping data enables LLM to suggest material splits for better EPD granularity
   const modelContext = useMemo((): { summary: ModelSummary } | null => {
     const visibleModels = getAllVisibleModels();
+    // Check for legacy single-file state (ifcDataStore populated but no models in Map)
+    const hasLegacyModel = !!(ifcDataStore && geometryResult);
+
     console.log('[ChatPanel] Checking modelContext:', {
       hasLcaResults: !!lcaResults,
       extractedMaterialsCount: extractedMaterials.length,
       modelsCount: models.size,
       visibleModelsCount: visibleModels.length,
+      hasLegacyModel,
     });
+
     if (!lcaResults || extractedMaterials.length === 0) return null;
 
-    if (visibleModels.length === 0) return null;
+    // For federated models, check if there are visible models
+    // For legacy single-file mode, we have data in ifcDataStore/geometryResult but not in models Map
+    if (visibleModels.length === 0 && !hasLegacyModel) return null;
 
     // Build the model summary with full context including spatial breakdown
-    const summary = buildModelSummary(visibleModels, extractedMaterials, lcaResults);
+    // Use visible models if available, otherwise create a placeholder for legacy mode
+    const modelsForSummary = visibleModels.length > 0 ? visibleModels : [{
+      id: '__legacy__',
+      name: 'Model',
+      ifcDataStore,
+      geometryResult,
+      visible: true,
+      collapsed: false,
+      schemaVersion: ifcDataStore?.schemaVersion || 'IFC4',
+      loadedAt: Date.now(),
+      fileSize: ifcDataStore?.fileSize || 0,
+    }] as any[];
+
+    const summary = buildModelSummary(modelsForSummary, extractedMaterials, lcaResults);
 
     // Log payload size for debugging
     const payloadSize = estimatePayloadSize(summary);
@@ -262,7 +285,7 @@ export function ChatPanel() {
     }
 
     return { summary };
-  }, [lcaResults, extractedMaterials, getAllVisibleModels, models]); // Added models for reactivity
+  }, [lcaResults, extractedMaterials, getAllVisibleModels, models, ifcDataStore, geometryResult]); // Added models + legacy state for reactivity
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
