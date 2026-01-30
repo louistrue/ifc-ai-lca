@@ -211,9 +211,10 @@ export function ChatPanel() {
   const setAgentProcessing = useViewerStore((s) => s.setAgentProcessing);
   const isAgentProcessing = useViewerStore((s) => s.isAgentProcessing);
 
-  // Model context
+  // Model context - subscribe to actual models data, not just the function
   const lcaResults = useViewerStore((s) => s.lcaResults);
   const extractedMaterials = useViewerStore((s) => s.extractedMaterials);
+  const models = useViewerStore((s) => s.models); // Subscribe to models map for reactivity
   const getAllVisibleModels = useViewerStore((s) => s.getAllVisibleModels);
 
   // Local input state
@@ -235,17 +236,19 @@ export function ChatPanel() {
   // - NO element details pre-fetched (agent requests on-demand)
   // - Grouping data enables LLM to suggest material splits for better EPD granularity
   const modelContext = useMemo((): { summary: ModelSummary } | null => {
+    const visibleModels = getAllVisibleModels();
     console.log('[ChatPanel] Checking modelContext:', {
       hasLcaResults: !!lcaResults,
       extractedMaterialsCount: extractedMaterials.length,
+      modelsCount: models.size,
+      visibleModelsCount: visibleModels.length,
     });
     if (!lcaResults || extractedMaterials.length === 0) return null;
 
-    const models = getAllVisibleModels();
-    if (models.length === 0) return null;
+    if (visibleModels.length === 0) return null;
 
     // Build the model summary with full context including spatial breakdown
-    const summary = buildModelSummary(models, extractedMaterials, lcaResults);
+    const summary = buildModelSummary(visibleModels, extractedMaterials, lcaResults);
 
     // Log payload size for debugging
     const payloadSize = estimatePayloadSize(summary);
@@ -259,7 +262,7 @@ export function ChatPanel() {
     }
 
     return { summary };
-  }, [lcaResults, extractedMaterials, getAllVisibleModels]);
+  }, [lcaResults, extractedMaterials, getAllVisibleModels, models]); // Added models for reactivity
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
