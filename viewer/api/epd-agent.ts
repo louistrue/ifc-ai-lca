@@ -703,6 +703,72 @@ function handleGetHighImpactElements(
   return output;
 }
 
+/**
+ * Calculate relevance score for an EPD based on search criteria
+ */
+function calculateRelevanceScore(
+  epd: EPDSimplified,
+  args: { category?: string; keywords?: string[]; gwp_max?: number }
+): number {
+  let score = 0;
+  const nameLower = epd.name.toLowerCase();
+  const keywordsLower = (epd.keywords || []).map(k => k.toLowerCase());
+
+  // Category match (highest weight)
+  if (args.category) {
+    if (epd.category === args.category) {
+      score += 100;
+    } else {
+      // Partial match for related categories
+      const relatedCategories: Record<string, string[]> = {
+        CONCRETE: ['MASONRY'],
+        STEEL: ['ALUMINUM'],
+        WOOD: ['INSULATION'],
+        INSULATION: ['PLASTIC', 'MEMBRANE'],
+      };
+      if (relatedCategories[args.category]?.includes(epd.category)) {
+        score += 30;
+      }
+    }
+  }
+
+  // Keyword matching (medium weight)
+  if (args.keywords && args.keywords.length > 0) {
+    for (const kw of args.keywords) {
+      const kwLower = kw.toLowerCase();
+      if (nameLower.includes(kwLower)) {
+        score += 25;
+      }
+      if (keywordsLower.some(ek => ek.includes(kwLower))) {
+        score += 15;
+      }
+      if ((epd.subcategory || '').toLowerCase().includes(kwLower)) {
+        score += 10;
+      }
+    }
+  }
+
+  // Eco-friendly indicators bonus
+  if (nameLower.includes('recyc') || nameLower.includes('sekundär')) score += 20;
+  if (nameLower.includes('low carbon') || nameLower.includes('co2-reduziert')) score += 20;
+  if (nameLower.includes('öko') || nameLower.includes('eco') || nameLower.includes('grün')) score += 15;
+  if (nameLower.includes('cem iii') || nameLower.includes('hochofen')) score += 15;
+
+  // GWP efficiency bonus (lower is better, but avoid 0)
+  if (epd.gwp > 0 && args.gwp_max !== undefined) {
+    const gwpRatio = epd.gwp / args.gwp_max;
+    if (gwpRatio < 0.5) score += 30;
+    else if (gwpRatio < 0.8) score += 15;
+  }
+
+  // Wood gets bonus for negative GWP (carbon storage)
+  if (epd.category === 'WOOD' && epd.gwp < 0) {
+    score += 25;
+  }
+
+  return score;
+}
+
 function handleSearchEPD(args: {
   category?: string;
   gwp_max?: number;
@@ -712,7 +778,7 @@ function handleSearchEPD(args: {
   recycled_content_min?: number;
 }, epdDatabase?: EPDSimplified[]): string {
   // Use passed EPD database if available, otherwise fall back to mock
-  let results: EPDSimplified[] = epdDatabase && epdDatabase.length > 0
+  let allEpds: EPDSimplified[] = epdDatabase && epdDatabase.length > 0
     ? [...epdDatabase]
     : Object.values(mockEPDs).map(e => ({
         id: e.id,
@@ -723,52 +789,79 @@ function handleSearchEPD(args: {
         keywords: e.keywords,
       }));
 
-  // Apply filters
-  if (args.category) {
-    results = results.filter(e => e.category === args.category);
-  }
-  if (args.gwp_max !== undefined) {
-    results = results.filter(e => e.gwp <= args.gwp_max!);
-  }
-  if (args.keywords && args.keywords.length > 0) {
-    const lowerKeywords = args.keywords.map(k => k.toLowerCase());
-    results = results.filter(e =>
-      lowerKeywords.some(kw =>
-        (e.keywords || []).some(ek => ek.toLowerCase().includes(kw)) ||
-        e.name.toLowerCase().includes(kw) ||
-        (e.subcategory || '').toLowerCase().includes(kw)
-      )
-    );
-  }
-  // Note: use_case and suitable_for filters are less relevant with Ökobaudat data
-  // as this info isn't directly available. We rely on keywords/name matching instead.
+  // Calculate relevance scores and filter
+  const scoredResults = allEpds.map(epd => ({
+    epd,
+    score: calculateRelevanceScore(epd, args),
+  }));
 
-  // Sort by GWP (lowest first for typical materials, but handle negative values for wood)
-  results.sort((a, b) => a.gwp - b.gwp);
+  // Filter: require minimum relevance or category match
+  let results = scoredResults
+    .filter(r => r.score >= 10 || (args.category && r.epd.category === args.category))
+    .sort((a, b) => {
+      // Primary: sort by score descending
+      if (b.score !== a.score) return b.score - a.score;
+      // Secondary: sort by GWP ascending (lower is better)
+      return a.epd.gwp - b.epd.gwp;
+    });
+
+  // Apply GWP max filter (soft filter - prioritize under limit but show some over)
+  if (args.gwp_max !== undefined) {
+    const underLimit = results.filter(r => r.epd.gwp <= args.gwp_max!);
+    const overLimit = results.filter(r => r.epd.gwp > args.gwp_max!).slice(0, 3);
+    results = [...underLimit, ...overLimit];
+  }
 
   // Limit results for readability
-  const displayResults = results.slice(0, 20);
+  const displayResults = results.slice(0, 15);
 
-  if (results.length === 0) {
+  if (displayResults.length === 0) {
+    // Fallback: show any EPDs in the category
+    const categoryMatches = allEpds
+      .filter(e => !args.category || e.category === args.category)
+      .sort((a, b) => a.gwp - b.gwp)
+      .slice(0, 10);
+
+    if (categoryMatches.length > 0) {
+      let output = `=== EPD SEARCH RESULTS (showing all ${args.category || 'all'} EPDs) ===\n`;
+      output += `Note: No exact matches found. Showing ${categoryMatches.length} EPDs in category.\n\n`;
+
+      for (const epd of categoryMatches) {
+        output += `[${epd.id}] ${epd.name}\n`;
+        output += `  GWP: ${epd.gwp.toFixed(2)} kg CO₂e/${epd.unit}\n`;
+        output += `  Category: ${epd.category}`;
+        if (epd.subcategory) output += ` / ${epd.subcategory}`;
+        output += '\n\n';
+      }
+      return output;
+    }
+
     return `No EPDs found matching the criteria. Database has ${epdDatabase?.length || 0} EPDs. Try broadening your search or using different keywords.`;
   }
 
-  let output = `=== EPD SEARCH RESULTS (${displayResults.length} of ${results.length}) ===\n\n`;
+  let output = `=== EPD SEARCH RESULTS (${displayResults.length} matches, sorted by relevance) ===\n\n`;
 
-  for (const epd of displayResults) {
+  for (const { epd, score } of displayResults) {
     output += `[${epd.id}] ${epd.name}\n`;
-    output += `  GWP: ${epd.gwp.toFixed(2)} kg CO₂e/${epd.unit}\n`;
+    output += `  GWP: ${epd.gwp.toFixed(2)} kg CO₂e/${epd.unit}`;
+    if (args.gwp_max && epd.gwp < args.gwp_max) {
+      const savings = ((args.gwp_max - epd.gwp) / args.gwp_max * 100).toFixed(0);
+      output += ` (${savings}% lower than target)`;
+    }
+    output += '\n';
     output += `  Category: ${epd.category}`;
     if (epd.subcategory) output += ` / ${epd.subcategory}`;
-    output += '\n';
+    output += ` | Relevance: ${score}\n`;
     if (epd.manufacturer) output += `  Source: ${epd.manufacturer}\n`;
-    if (epd.plantLocation) output += `  Location: ${epd.plantLocation}\n`;
     output += '\n';
   }
 
-  if (results.length > 20) {
-    output += `\n... and ${results.length - 20} more results. Refine your search for more specific matches.\n`;
+  if (results.length > 15) {
+    output += `\n... and ${results.length - 15} more results.\n`;
   }
+
+  // Add helpful suggestions
+  output += `\n💡 TIP: Use 'get_epd_details' with an EPD ID to see full details before proposing.\n`;
 
   return output;
 }
