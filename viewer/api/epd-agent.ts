@@ -123,11 +123,26 @@ interface EPDProposal {
   status: 'pending' | 'accepted' | 'rejected';
 }
 
+/** EPD data passed from frontend (simplified for API payload) */
+interface EPDSimplified {
+  id: string;
+  name: string;
+  category: string;
+  subcategory?: string;
+  gwp: number;
+  unit: string;
+  manufacturer?: string;
+  keywords?: string[];
+  plantLocation?: string;
+  dataQuality?: string;
+}
+
 interface AgentRequest {
   message: string;
   modelContext: ModelSummary;
   elementIndex?: ElementIndex[];
   elementDetails?: Record<string, ElementDetail[]>; // Pre-fetched details keyed by materialId
+  epdDatabase?: EPDSimplified[]; // Real EPDs from Ökobaudat passed from frontend
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
@@ -695,8 +710,18 @@ function handleSearchEPD(args: {
   use_case?: string;
   suitable_for?: string;
   recycled_content_min?: number;
-}): string {
-  let results = Object.values(mockEPDs);
+}, epdDatabase?: EPDSimplified[]): string {
+  // Use passed EPD database if available, otherwise fall back to mock
+  let results: EPDSimplified[] = epdDatabase && epdDatabase.length > 0
+    ? [...epdDatabase]
+    : Object.values(mockEPDs).map(e => ({
+        id: e.id,
+        name: e.name,
+        category: e.category,
+        gwp: e.gwp,
+        unit: e.unit,
+        keywords: e.keywords,
+      }));
 
   // Apply filters
   if (args.category) {
@@ -705,50 +730,69 @@ function handleSearchEPD(args: {
   if (args.gwp_max !== undefined) {
     results = results.filter(e => e.gwp <= args.gwp_max!);
   }
-  if (args.use_case) {
-    results = results.filter(e => e.use_cases.includes(args.use_case!));
-  }
-  if (args.suitable_for) {
-    results = results.filter(e => e.suitable_for.includes(args.suitable_for!));
-  }
-  if (args.recycled_content_min !== undefined) {
-    results = results.filter(e => (e.recycled_content || 0) >= args.recycled_content_min!);
-  }
   if (args.keywords && args.keywords.length > 0) {
     const lowerKeywords = args.keywords.map(k => k.toLowerCase());
     results = results.filter(e =>
       lowerKeywords.some(kw =>
-        e.keywords.some(ek => ek.includes(kw)) ||
-        e.name.toLowerCase().includes(kw)
+        (e.keywords || []).some(ek => ek.toLowerCase().includes(kw)) ||
+        e.name.toLowerCase().includes(kw) ||
+        (e.subcategory || '').toLowerCase().includes(kw)
       )
     );
   }
+  // Note: use_case and suitable_for filters are less relevant with Ökobaudat data
+  // as this info isn't directly available. We rely on keywords/name matching instead.
 
-  // Sort by GWP (lowest first)
+  // Sort by GWP (lowest first for typical materials, but handle negative values for wood)
   results.sort((a, b) => a.gwp - b.gwp);
 
+  // Limit results for readability
+  const displayResults = results.slice(0, 20);
+
   if (results.length === 0) {
-    return 'No EPDs found matching the criteria. Try broadening your search.';
+    return `No EPDs found matching the criteria. Database has ${epdDatabase?.length || 0} EPDs. Try broadening your search or using different keywords.`;
   }
 
-  let output = `=== EPD SEARCH RESULTS (${results.length}) ===\n\n`;
+  let output = `=== EPD SEARCH RESULTS (${displayResults.length} of ${results.length}) ===\n\n`;
 
-  for (const epd of results) {
+  for (const epd of displayResults) {
     output += `[${epd.id}] ${epd.name}\n`;
-    output += `  GWP: ${epd.gwp} kg CO₂e/${epd.unit}\n`;
-    output += `  Category: ${epd.category}\n`;
-    if (epd.fire_rating) output += `  Fire Rating: ${epd.fire_rating}\n`;
-    if (epd.recycled_content) output += `  Recycled Content: ${epd.recycled_content}%\n`;
-    output += `  Suitable for: ${epd.suitable_for.join(', ')}\n`;
+    output += `  GWP: ${epd.gwp.toFixed(2)} kg CO₂e/${epd.unit}\n`;
+    output += `  Category: ${epd.category}`;
+    if (epd.subcategory) output += ` / ${epd.subcategory}`;
     output += '\n';
+    if (epd.manufacturer) output += `  Source: ${epd.manufacturer}\n`;
+    if (epd.plantLocation) output += `  Location: ${epd.plantLocation}\n`;
+    output += '\n';
+  }
+
+  if (results.length > 20) {
+    output += `\n... and ${results.length - 20} more results. Refine your search for more specific matches.\n`;
   }
 
   return output;
 }
 
-function handleGetEPD(args: { epd_id: string }): string {
+function handleGetEPD(args: { epd_id: string }, epdDatabase?: EPDSimplified[]): string {
+  // Try to find in passed database first
+  const dbEpd = epdDatabase?.find(e => e.id === args.epd_id);
+  if (dbEpd) {
+    return `=== ${dbEpd.name} ===
+ID: ${dbEpd.id}
+Category: ${dbEpd.category}${dbEpd.subcategory ? ` / ${dbEpd.subcategory}` : ''}
+
+ENVIRONMENTAL IMPACT:
+  GWP (A1-A3): ${dbEpd.gwp.toFixed(2)} kg CO₂e/${dbEpd.unit}
+
+SOURCE: ${dbEpd.manufacturer || 'Ökobaudat'}
+LOCATION: ${dbEpd.plantLocation || 'Germany'}
+DATA QUALITY: ${dbEpd.dataQuality || 'average'}
+KEYWORDS: ${(dbEpd.keywords || []).join(', ') || 'N/A'}`;
+  }
+
+  // Fall back to mock database
   const epd = mockEPDs[args.epd_id];
-  if (!epd) return `EPD "${args.epd_id}" not found. Try searching with search_epd_database.`;
+  if (!epd) return `EPD "${args.epd_id}" not found in database (${epdDatabase?.length || 0} EPDs available). Try searching with search_epd_database.`;
 
   return `=== ${epd.name} ===
 ID: ${epd.id}
@@ -766,8 +810,29 @@ SUITABLE FOR: ${epd.suitable_for.join(', ')}
 KEYWORDS: ${epd.keywords.join(', ')}`;
 }
 
-function handleCompare(args: { epd_ids: string[] }): string {
-  const epds = args.epd_ids.map(id => mockEPDs[id]).filter(Boolean);
+function handleCompare(args: { epd_ids: string[] }, epdDatabase?: EPDSimplified[]): string {
+  // Try to find EPDs in passed database first
+  const epds: Array<{ id: string; name: string; category: string; gwp: number; unit: string; fire_rating?: string; recycled_content?: number; suitable_for: string[] }> = [];
+
+  for (const id of args.epd_ids) {
+    const dbEpd = epdDatabase?.find(e => e.id === id);
+    if (dbEpd) {
+      epds.push({
+        id: dbEpd.id,
+        name: dbEpd.name,
+        category: dbEpd.category,
+        gwp: dbEpd.gwp,
+        unit: dbEpd.unit,
+        suitable_for: [],
+      });
+    } else {
+      const mockEpd = mockEPDs[id];
+      if (mockEpd) {
+        epds.push(mockEpd);
+      }
+    }
+  }
+
   if (epds.length < 2) return 'Need at least 2 valid EPD IDs to compare.';
 
   let output = '=== EPD COMPARISON ===\n\n';
@@ -820,23 +885,32 @@ function handleCompare(args: { epd_ids: string[] }): string {
 
 function handleProposal(
   args: { material_id: string; proposed_epd_id: string; confidence: number; reasoning: string; key_benefits?: string[] },
-  context: ModelSummary
+  context: ModelSummary,
+  epdDatabase?: EPDSimplified[]
 ): { result: string; proposal?: EPDProposal } {
   const mat = context.materials.find(m => m.id === args.material_id);
   if (!mat) return { result: `Material "${args.material_id}" not found.` };
 
-  const epd = mockEPDs[args.proposed_epd_id];
-  if (!epd) return { result: `EPD "${args.proposed_epd_id}" not found.` };
+  // Try to find EPD in passed database first
+  const dbEpd = epdDatabase?.find(e => e.id === args.proposed_epd_id);
+  const mockEpd = mockEPDs[args.proposed_epd_id];
+
+  const epd = dbEpd || mockEpd;
+  if (!epd) return { result: `EPD "${args.proposed_epd_id}" not found in database (${epdDatabase?.length || 0} EPDs available).` };
+
+  const epdGwp = 'gwp' in epd ? epd.gwp : 0;
+  const epdUnit = 'unit' in epd ? epd.unit : 'kg';
+  const epdName = epd.name;
 
   // Calculate GWP based on unit
   let quantity = mat.totalVolume;
-  if (epd.unit === 'kg') {
+  if (epdUnit === 'kg') {
     quantity = mat.totalWeight || mat.totalVolume * 2400; // Default density for concrete
-  } else if (epd.unit === 'm2') {
+  } else if (epdUnit === 'm2') {
     quantity = mat.totalArea;
   }
 
-  const proposedGWP = epd.gwp * quantity;
+  const proposedGWP = epdGwp * quantity;
   const currentGWP = mat.currentEpd?.calculatedGwp || 0;
   const gwpDiff = proposedGWP - currentGWP;
   const gwpDiffPercent = currentGWP > 0 ? (gwpDiff / currentGWP) * 100 : 0;
@@ -849,7 +923,7 @@ function handleProposal(
     current_epd_name: mat.currentEpd?.name,
     current_gwp: currentGWP,
     proposed_epd_id: args.proposed_epd_id,
-    proposed_epd_name: epd.name,
+    proposed_epd_name: epdName,
     proposed_gwp: proposedGWP,
     gwp_difference: gwpDiff,
     gwp_difference_percent: gwpDiffPercent,
@@ -863,7 +937,7 @@ function handleProposal(
   const direction = gwpDiff < 0 ? 'reduction' : gwpDiff > 0 ? 'increase' : 'no change';
 
   return {
-    result: `${emoji} PROPOSAL CREATED\n\nMaterial: ${mat.name}\nProposed EPD: ${epd.name}\nGWP Change: ${gwpDiff >= 0 ? '+' : ''}${gwpDiff.toFixed(0)} kg CO₂e (${gwpDiffPercent >= 0 ? '+' : ''}${gwpDiffPercent.toFixed(1)}% ${direction})\n\nThe proposal has been created for user review.`,
+    result: `${emoji} PROPOSAL CREATED\n\nMaterial: ${mat.name}\nProposed EPD: ${epdName}\nGWP Change: ${gwpDiff >= 0 ? '+' : ''}${gwpDiff.toFixed(0)} kg CO₂e (${gwpDiffPercent >= 0 ? '+' : ''}${gwpDiffPercent.toFixed(1)}% ${direction})\n\nThe proposal has been created for user review.`,
     proposal,
   };
 }
@@ -1100,7 +1174,8 @@ function executeToolCall(
   toolName: string,
   args: Record<string, unknown>,
   context: ModelSummary,
-  elementDetails?: Record<string, ElementDetail[]>
+  elementDetails?: Record<string, ElementDetail[]>,
+  epdDatabase?: EPDSimplified[]
 ): { result: string; proposal?: EPDProposal } {
   switch (toolName) {
     case 'get_model_overview':
@@ -1114,15 +1189,16 @@ function executeToolCall(
     case 'get_high_impact_elements':
       return { result: handleGetHighImpactElements(args as { limit?: number }, context) };
     case 'search_epd_database':
-      return { result: handleSearchEPD(args as { category?: string; gwp_max?: number }) };
+      return { result: handleSearchEPD(args as { category?: string; gwp_max?: number }, epdDatabase) };
     case 'get_epd_details':
-      return { result: handleGetEPD(args as { epd_id: string }) };
+      return { result: handleGetEPD(args as { epd_id: string }, epdDatabase) };
     case 'compare_epds':
-      return { result: handleCompare(args as { epd_ids: string[] }) };
+      return { result: handleCompare(args as { epd_ids: string[] }, epdDatabase) };
     case 'propose_epd_mapping':
       return handleProposal(
         args as { material_id: string; proposed_epd_id: string; confidence: number; reasoning: string; key_benefits?: string[] },
-        context
+        context,
+        epdDatabase
       );
     case 'suggest_material_split':
       return handleSuggestMaterialSplit(
@@ -1210,7 +1286,10 @@ export default async function handler(req: Request) {
 
   try {
     const body: AgentRequest = await req.json();
-    const { message, modelContext, elementDetails, conversationHistory = [] } = body;
+    const { message, modelContext, elementDetails, epdDatabase, conversationHistory = [] } = body;
+
+    // Log EPD database info
+    console.log(`[Agent] Received ${epdDatabase?.length || 0} EPDs from frontend`);
 
     // Build context summary for system prompt
     let contextSummary = '\n\n--- CURRENT MODEL ---\n';
@@ -1221,6 +1300,9 @@ export default async function handler(req: Request) {
     if (modelContext.lca) {
       contextSummary += `Total GWP: ${modelContext.lca.totalGwp.toLocaleString()} kg CO₂e\n`;
     }
+
+    // Add EPD database info
+    contextSummary += `EPD Database: ${epdDatabase?.length || 0} EPDs from Ökobaudat\n`;
 
     contextSummary += '\nMaterials summary:\n';
     for (const mat of modelContext.materials.slice(0, 10)) {
@@ -1289,7 +1371,7 @@ export default async function handler(req: Request) {
 
           console.log(`[Agent] Tool: ${toolName}`, toolArgs);
 
-          const { result, proposal } = executeToolCall(toolName, toolArgs, modelContext, elementDetails);
+          const { result, proposal } = executeToolCall(toolName, toolArgs, modelContext, elementDetails, epdDatabase);
 
           if (proposal) {
             proposals.push(proposal);

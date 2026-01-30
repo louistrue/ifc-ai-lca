@@ -63,16 +63,46 @@ export async function loadOekobaudatEPDs(): Promise<EPD[]> {
   }
 
   try {
-    // Load EPDs for main construction material categories (German terms for better results)
+    // Load EPDs for diverse construction material categories (German terms for better API results)
+    // Expanded search to get 100-150+ real EPDs covering common building materials
     const searchTerms = [
-      'Beton', // Concrete
-      'Stahl', // Steel
-      'Holz', // Wood
+      // Concrete varieties
+      'Beton', // Generic concrete
+      'Transportbeton', // Ready-mix concrete
+      'Betonfertigteil', // Precast concrete
+      'Stahlbeton', // Reinforced concrete
+      // Steel varieties
+      'Stahl', // Generic steel
+      'Baustahl', // Structural steel
+      'Bewehrungsstahl', // Rebar
+      'Stahlprofil', // Steel sections
+      // Wood varieties
+      'Holz', // Generic wood
+      'Brettschichtholz', // Glulam
+      'Brettsperrholz', // CLT
+      'Schnittholz', // Sawn timber
+      'Spanplatte', // Chipboard/particleboard
+      // Insulation varieties
+      'Dämmstoff', // Generic insulation
+      'Mineralwolle', // Mineral wool
+      'Steinwolle', // Stone wool
+      'Glaswolle', // Glass wool
+      'EPS', // Expanded polystyrene
+      'XPS', // Extruded polystyrene
+      // Other construction materials
       'Glas', // Glass
-      'Dämmstoff', // Insulation
+      'Fenster', // Windows
       'Aluminium', // Aluminum
       'Gips', // Gypsum
-      'Ziegel', // Masonry/Brick
+      'Gipskarton', // Gypsum board
+      'Ziegel', // Brick
+      'Mauerwerk', // Masonry
+      'Putz', // Plaster/render
+      'Estrich', // Screed
+      'Fliese', // Tiles
+      'Dach', // Roofing
+      'Abdichtung', // Waterproofing/membranes
+      'Farbe', // Paint/coatings
     ];
 
     const allEPDs: EPD[] = [];
@@ -83,7 +113,7 @@ export async function loadOekobaudatEPDs(): Promise<EPD[]> {
         const epds = await fetchFromOekobaudat({
           search: term,
           compliance: 'A2',
-          pageSize: 25,
+          pageSize: 15, // 15 per term × 36 terms = up to 540, but deduplication gives ~100-200
         });
 
         for (const epd of epds) {

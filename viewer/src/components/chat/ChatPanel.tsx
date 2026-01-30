@@ -19,6 +19,7 @@ import { Send, Bot, User, Loader2, AlertCircle, Copy, Check, Wand2, Leaf, Search
 import { EPDProposalsList } from './EPDProposalCard';
 import type { EPDProposal } from '../../store/slices/lcaSlice';
 import { buildModelSummary, estimatePayloadSize, type ModelSummary } from '../../lib/model-context';
+import { getEPDDatabase } from '../../lib/epd/database';
 
 /** EPD Agent API endpoint */
 const AGENT_API_ENDPOINT = import.meta.env.DEV
@@ -270,14 +271,30 @@ export function ChatPanel() {
     addChatMessage({ role: 'user', content: userMessage });
 
     try {
+      // Get the real EPD database loaded from Ökobaudat
+      const epdDatabase = getEPDDatabase();
+
       // Send model context with all materials and spatial breakdown
       // Element details are NOT pre-sent - agent requests on-demand via tools
+      // EPD database is passed so agent can search real EPDs, not mock data
       const response = await fetch(AGENT_API_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: userMessage,
           modelContext: modelContext.summary,
+          epdDatabase: epdDatabase.map(epd => ({
+            id: epd.id,
+            name: epd.name,
+            category: epd.category,
+            subcategory: epd.subcategory,
+            gwp: epd.impacts.gwp,
+            unit: epd.declaredUnit.unit,
+            manufacturer: epd.manufacturer,
+            keywords: epd.keywords,
+            plantLocation: epd.plantLocation,
+            dataQuality: epd.dataQuality,
+          })),
           conversationHistory: chatMessages.slice(-6).map(m => ({
             role: m.role,
             content: m.content
