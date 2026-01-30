@@ -1305,52 +1305,28 @@ function executeToolCall(
 
 // ============ System Prompt ============
 
-const systemPrompt = `You are an expert EPD (Environmental Product Declaration) matching agent for building Life Cycle Assessment (LCA).
+const systemPrompt = `You are an EPD matching agent for building LCA. Be CONCISE and ACTION-ORIENTED.
 
-You have FULL ACCESS to the building model data through your tools:
-- Project information (element counts, spatial structure, total volumes)
-- All materials with quantities, element types (with volumes), and properties
-- SPATIAL BREAKDOWN: Materials show above/below ground distribution and per-storey volumes
-- USAGE CONTEXT: Materials tagged as structural, exterior, foundation with primary use
-- Current EPD mappings with GWP values
-- Individual element details when needed
+TOOLS AVAILABLE:
+- search_epd_database: Find EPDs by category/keywords (ALWAYS search before proposing)
+- propose_epd_mapping: Create EPD proposals (use after finding good options)
+- get_high_impact_elements: Identify materials with highest GWP
 
-YOUR ROLE:
-1. Analyze the building model to understand materials and their usage context
-2. Identify opportunities for carbon reduction through better EPD choices
-3. CRITICAL: Check for materials that span different contexts (e.g., concrete both below and above ground)
-4. Suggest material splits when a single EPD cannot accurately represent varied usage
-5. Propose EPD mappings with detailed, context-aware reasoning
+QUICK WORKFLOW:
+1. Identify high-impact materials from the context provided
+2. Search for lower-GWP alternatives: search_epd_database(category, keywords, gwp_max)
+3. Propose better EPDs: propose_epd_mapping(material_id, epd_id, confidence, reasoning)
 
-MATERIAL GRANULARITY - KEY CONCEPT:
-The same material (e.g., "Concrete C30/37") may need DIFFERENT EPDs based on:
-- ELEVATION: Below-ground concrete needs durability/waterproofing EPDs; above-ground is standard
-- ELEMENT TYPE: Column concrete (high-strength) vs slab concrete (standard) vs foundation (durable)
-- USAGE: Structural vs facade vs interior applications have different requirements
+PRIORITY TARGETS:
+- Materials with highest total GWP (volume × GWP factor)
+- Look for "recycled", "CEM III", "low carbon" options
+- Wood products have negative GWP (carbon storage)
 
-Look for "⚡ SPLIT OPPORTUNITY" flags in model overview - these indicate materials that span multiple contexts.
-
-WORKFLOW FOR EPD OPTIMIZATION:
-1. Start with get_model_overview to understand the building and identify split opportunities
-2. Use get_high_impact_elements to prioritize materials by GWP contribution
-3. For each priority material:
-   a. Check spatialBreakdown and usageContext in the overview
-   b. If material spans multiple contexts (below+above ground, multiple element types), use suggest_material_split
-   c. Use get_material_details for full breakdown
-4. Search for appropriate EPDs with search_epd_database using context-specific filters
-5. Compare options with compare_epds
-6. Create proposals with propose_epd_mapping, specifying which portion of the material if split
-
-IMPORTANT GUIDELINES:
-- ALWAYS check spatial breakdown before proposing an EPD - one EPD may not fit all uses
-- Use suggest_material_split(material_id, "elevation") for materials spanning above/below ground
-- Use suggest_material_split(material_id, "element_type") for materials used in diverse element types
-- Consider fire ratings and structural requirements mentioned in properties
-- Prioritize lower GWP options that still meet technical requirements
-- Explain your reasoning clearly, referencing specific element types, locations, and quantities
-- When a split is recommended, create separate proposals for each sub-material context
-
-Be thorough but efficient. Focus on actionable recommendations that reduce carbon while maintaining technical accuracy.`;
+RULES:
+- Search FIRST, then propose - never propose without searching
+- Keep responses brief - user sees proposals as cards
+- Focus on 2-3 highest impact improvements
+- Confidence: 0.9 if exact match, 0.7 if similar, 0.5 if approximate`;
 
 // ============ Main Handler ============
 
@@ -1417,8 +1393,9 @@ export default async function handler(req: Request) {
     const proposals: EPDProposal[] = [];
     const toolResults: Array<{ tool: string; result: string }> = [];
 
-    // Agent loop - max 8 iterations for thorough analysis
-    for (let i = 0; i < 8; i++) {
+    // Agent loop - max 3 iterations for fast responses
+    // First iteration: analyze, Second: search/propose, Third: finalize
+    for (let i = 0; i < 3; i++) {
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -1429,7 +1406,8 @@ export default async function handler(req: Request) {
           model: 'gpt-4o-mini',
           messages,
           tools: toolDefinitions,
-          tool_choice: 'auto',
+          tool_choice: i === 2 ? 'none' : 'auto', // Force text response on last iteration
+          max_tokens: 1500, // Limit response length for speed
         }),
       });
 
