@@ -1305,28 +1305,28 @@ function executeToolCall(
 
 // ============ System Prompt ============
 
-const systemPrompt = `You are an EPD matching agent for building LCA. Be CONCISE and ACTION-ORIENTED.
+const systemPrompt = `You are an EPD matching agent. Your ONLY job is to CREATE PROPOSAL CARDS using the propose_epd_mapping tool.
 
-TOOLS AVAILABLE:
-- search_epd_database: Find EPDs by category/keywords (ALWAYS search before proposing)
-- propose_epd_mapping: Create EPD proposals (use after finding good options)
-- get_high_impact_elements: Identify materials with highest GWP
+CRITICAL RULE: You MUST call propose_epd_mapping to create clickable cards. Text-only responses are USELESS.
 
-QUICK WORKFLOW:
-1. Identify high-impact materials from the context provided
-2. Search for lower-GWP alternatives: search_epd_database(category, keywords, gwp_max)
-3. Propose better EPDs: propose_epd_mapping(material_id, epd_id, confidence, reasoning)
+REQUIRED WORKFLOW:
+1. Search: search_epd_database({category: "STEEL", keywords: ["recycled"]})
+2. IMMEDIATELY CREATE PROPOSALS: propose_epd_mapping({
+     material_id: "mat-ifcbeam",  // from model context
+     proposed_epd_id: "oekobaudat-xxx",  // from search
+     confidence: 0.7,
+     reasoning: "17% lower GWP recycled steel",
+     key_benefits: ["Lower carbon", "High recycled content"]
+   })
 
-PRIORITY TARGETS:
-- Materials with highest total GWP (volume × GWP factor)
-- Look for "recycled", "CEM III", "low carbon" options
-- Wood products have negative GWP (carbon storage)
+ALWAYS create 2-3 proposals per request. Users can ONLY accept/reject via cards.
 
-RULES:
-- Search FIRST, then propose - never propose without searching
-- Keep responses brief - user sees proposals as cards
-- Focus on 2-3 highest impact improvements
-- Confidence: 0.9 if exact match, 0.7 if similar, 0.5 if approximate`;
+TARGETS:
+- STEEL: recycled/EAF steel ~1.0 kg CO2/kg (vs 1.8 primary)
+- CONCRETE: CEM III ~130 kg CO2/m³ (vs 200+ standard)
+- WOOD: negative GWP ~-500 kg CO2/m³ (carbon storage)
+
+DO NOT just describe options - USE propose_epd_mapping to create cards!`;
 
 // ============ Main Handler ============
 
@@ -1393,9 +1393,8 @@ export default async function handler(req: Request) {
     const proposals: EPDProposal[] = [];
     const toolResults: Array<{ tool: string; result: string }> = [];
 
-    // Agent loop - max 3 iterations for fast responses
-    // First iteration: analyze, Second: search/propose, Third: finalize
-    for (let i = 0; i < 3; i++) {
+    // Agent loop - max 4 iterations: search → propose → propose → finalize
+    for (let i = 0; i < 4; i++) {
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -1406,8 +1405,8 @@ export default async function handler(req: Request) {
           model: 'gpt-4o-mini',
           messages,
           tools: toolDefinitions,
-          tool_choice: i === 2 ? 'none' : 'auto', // Force text response on last iteration
-          max_tokens: 1500, // Limit response length for speed
+          tool_choice: i === 3 ? 'none' : 'auto', // Force text response on last iteration
+          max_tokens: 1000, // Limit response length for speed
         }),
       });
 
