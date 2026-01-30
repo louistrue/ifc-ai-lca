@@ -91,7 +91,10 @@ export function ViewerLayout() {
               </div>
             </Panel>
 
-            <PanelResizeHandle className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize" />
+            <PanelResizeHandle className="w-2 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize group relative">
+              {/* Extended hit area for easier grabbing */}
+              <div className="absolute inset-y-0 -left-1 -right-1 group-hover:bg-primary/10" />
+            </PanelResizeHandle>
 
             {/* Center - Viewport */}
             <Panel id="viewport-panel" defaultSize={58} minSize={30}>
@@ -100,7 +103,10 @@ export function ViewerLayout() {
               </div>
             </Panel>
 
-            <PanelResizeHandle className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize" />
+            <PanelResizeHandle className="w-2 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize group relative">
+              {/* Extended hit area for easier grabbing */}
+              <div className="absolute inset-y-0 -left-1 -right-1 group-hover:bg-primary/10" />
+            </PanelResizeHandle>
 
             {/* Right Panel - Properties/LCA/Chat */}
             <Panel

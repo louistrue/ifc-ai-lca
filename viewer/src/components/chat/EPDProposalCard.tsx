@@ -4,7 +4,7 @@
  */
 
 import React, { useState } from 'react';
-import { Check, X, ArrowRight, ArrowDown, TrendingDown, TrendingUp, Sparkles, Info, Loader2 } from 'lucide-react';
+import { Check, X, ArrowRight, TrendingDown, TrendingUp, Sparkles, Loader2 } from 'lucide-react';
 import { Button } from '../ui/button';
 import type { EPDProposal } from '../../store/slices/lcaSlice';
 
@@ -81,108 +81,62 @@ export function EPDProposalCard({ proposal, onAccept, onReject }: EPDProposalCar
   }
 
   return (
-    <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 space-y-2 w-full overflow-hidden">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-2 min-w-0">
-          <Sparkles className="w-4 h-4 text-primary flex-shrink-0" />
-          <span className="text-sm font-medium">EPD Proposal</span>
+    <div className="rounded-lg border border-primary/30 bg-primary/5 p-2 space-y-1.5 w-full overflow-hidden">
+      {/* Header - compact */}
+      <div className="flex items-center justify-between gap-1">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <Sparkles className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+          <span className="text-xs font-medium truncate">{proposal.material_name}</span>
         </div>
-        <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${getConfidenceColor(proposal.confidence)}`}>
+        <span className={`text-[10px] px-1.5 py-0.5 rounded-full whitespace-nowrap ${getConfidenceColor(proposal.confidence)}`}>
           {Math.round(proposal.confidence * 100)}%
         </span>
       </div>
 
-      {/* Material name */}
-      <div className="text-xs text-muted-foreground">
-        For: <span className="font-medium text-foreground">{proposal.material_name}</span>
-      </div>
-
-      {/* Current → Proposed - Stacked layout for narrow containers */}
-      <div className="space-y-2">
-        <div className="p-2 rounded bg-muted/50">
-          <div className="text-xs text-muted-foreground mb-0.5">Current</div>
-          <div className="text-sm truncate" title={proposal.current_epd_name}>{proposal.current_epd_name || 'No EPD'}</div>
-          {proposal.current_gwp !== undefined && (
-            <div className="text-xs text-muted-foreground mt-0.5">
-              {proposal.current_gwp.toLocaleString()} kg CO₂e
-            </div>
-          )}
+      {/* Current → Proposed - Compact horizontal on wide, vertical on narrow */}
+      <div className="flex gap-1.5 items-stretch text-xs">
+        <div className="flex-1 p-1.5 rounded bg-muted/50 min-w-0">
+          <div className="text-[10px] text-muted-foreground">Current</div>
+          <div className="truncate" title={proposal.current_epd_name}>{proposal.current_epd_name || 'No EPD'}</div>
+          <div className="text-[10px] text-muted-foreground">{proposal.current_gwp?.toLocaleString()} kg</div>
         </div>
-
-        <div className="flex justify-center">
-          <ArrowDown className="w-4 h-4 text-muted-foreground" />
+        <div className="flex items-center">
+          <ArrowRight className="w-3 h-3 text-muted-foreground" />
         </div>
-
-        <div className="p-2 rounded bg-primary/10 border border-primary/20">
-          <div className="text-xs text-primary mb-0.5">Proposed</div>
-          <div className="text-sm font-medium truncate" title={proposal.proposed_epd_name}>{proposal.proposed_epd_name}</div>
-          <div className="text-xs text-muted-foreground mt-0.5">
-            {proposal.proposed_gwp.toLocaleString()} kg CO₂e
-          </div>
+        <div className="flex-1 p-1.5 rounded bg-primary/10 border border-primary/20 min-w-0">
+          <div className="text-[10px] text-primary">Proposed</div>
+          <div className="truncate font-medium" title={proposal.proposed_epd_name}>{proposal.proposed_epd_name}</div>
+          <div className="text-[10px] text-muted-foreground">{proposal.proposed_gwp.toLocaleString()} kg</div>
         </div>
       </div>
 
-      {/* Impact change */}
-      <div className={`flex items-center gap-1.5 text-sm flex-wrap ${
+      {/* Impact change - inline compact */}
+      <div className={`flex items-center gap-1 text-xs ${
         isImprovement ? 'text-green-600 dark:text-green-400' : 'text-orange-600 dark:text-orange-400'
       }`}>
-        {isImprovement ? (
-          <TrendingDown className="w-4 h-4 flex-shrink-0" />
-        ) : (
-          <TrendingUp className="w-4 h-4 flex-shrink-0" />
-        )}
-        <span className="font-medium whitespace-nowrap">
-          {isImprovement ? '-' : '+'}{absChange.toFixed(1)}% GWP
-        </span>
-        <span className="text-xs text-muted-foreground whitespace-nowrap">
-          ({isImprovement ? '' : '+'}{proposal.gwp_difference.toLocaleString()} kg CO₂e)
-        </span>
+        {isImprovement ? <TrendingDown className="w-3.5 h-3.5" /> : <TrendingUp className="w-3.5 h-3.5" />}
+        <span className="font-semibold">{isImprovement ? '-' : '+'}{absChange.toFixed(0)}%</span>
+        <span className="text-[10px] text-muted-foreground">({(proposal.gwp_difference/1000).toFixed(1)}t CO₂e)</span>
       </div>
 
-      {/* Reasoning - collapsible on narrow screens */}
-      <div className="text-xs space-y-1.5">
-        <div className="flex items-start gap-1.5">
-          <Info className="w-3.5 h-3.5 text-muted-foreground mt-0.5 flex-shrink-0" />
-          <p className="text-muted-foreground line-clamp-3">{proposal.reasoning}</p>
-        </div>
-
-        {proposal.key_benefits.length > 0 && (
-          <ul className="pl-5 space-y-0.5 text-muted-foreground">
-            {proposal.key_benefits.slice(0, 2).map((benefit, i) => (
-              <li key={i} className="list-disc line-clamp-1">{benefit}</li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      {/* Action feedback */}
-      {actionFeedback && (
-        <div className="text-xs text-center py-1 px-2 bg-muted/50 rounded text-muted-foreground">
-          {actionFeedback}
-        </div>
-      )}
-
-      {/* Actions */}
-      <div className="flex gap-2 pt-1">
+      {/* Actions - compact */}
+      <div className="flex gap-1.5">
         <Button
           size="sm"
           variant="outline"
-          className="flex-1 h-9 text-xs border-red-500/30 text-red-600 hover:bg-red-500/10 hover:text-red-600"
+          className="flex-1 h-7 text-[11px] border-red-500/30 text-red-600 hover:bg-red-500/10"
           onClick={handleReject}
           disabled={isProcessing}
         >
-          {isProcessing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5 mr-1" />}
-          Reject
+          {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
         </Button>
         <Button
           size="sm"
-          className="flex-1 h-9 text-xs bg-green-600 hover:bg-green-700 text-white"
+          className="flex-1 h-7 text-[11px] bg-green-600 hover:bg-green-700 text-white"
           onClick={handleAccept}
           disabled={isProcessing}
         >
-          {isProcessing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5 mr-1" />}
-          Apply
+          {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Check className="w-3 h-3 mr-0.5" />Apply</>}
         </Button>
       </div>
     </div>

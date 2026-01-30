@@ -413,3 +413,26 @@ body {
   border-radius: 0.25rem;
   animation: skeleton-pulse 2s ease-in-out infinite;
 }
+
+/* Panel resize handle - fix sticky drag behavior */
+[data-panel-group-direction="horizontal"] > [data-resize-handle] {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Wider hit area for resize handles */
+[data-resize-handle]::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  left: -4px;
+  right: -4px;
+  z-index: 10;
+}
+
+[data-resize-handle]:hover,
+[data-resize-handle][data-resize-handle-active] {
+  background-color: var(--tokyo-blue) !important;
+  opacity: 0.7;
+}
