@@ -99,6 +99,7 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
 
   // Actions
   setExtractedMaterials: (materials) => {
+    console.log('[LCA] setExtractedMaterials called:', materials.length, 'materials');
     set({ extractedMaterials: materials });
   },
 
@@ -133,12 +134,20 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
 
   runEPDMatching: () => {
     const { extractedMaterials } = get();
+    console.log('[LCA] runEPDMatching called, materials count:', extractedMaterials.length);
     if (extractedMaterials.length === 0) {
+      console.log('[LCA] No materials to match, returning early');
       return;
     }
 
     set({ isMatchingInProgress: true });
+    console.log('[LCA] Running algorithmic EPD matching...');
     const results = matchAllMaterials(extractedMaterials);
+    console.log('[LCA] EPD matching complete:', {
+      matchCount: results.matches.length,
+      totalGWP: results.totalGWP,
+      unmatchedCount: results.unmatchedMaterials.length,
+    });
     set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: 'algorithmic' });
   },
 

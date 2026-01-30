@@ -235,6 +235,10 @@ export function ChatPanel() {
   // - NO element details pre-fetched (agent requests on-demand)
   // - Grouping data enables LLM to suggest material splits for better EPD granularity
   const modelContext = useMemo((): { summary: ModelSummary } | null => {
+    console.log('[ChatPanel] Checking modelContext:', {
+      hasLcaResults: !!lcaResults,
+      extractedMaterialsCount: extractedMaterials.length,
+    });
     if (!lcaResults || extractedMaterials.length === 0) return null;
 
     const models = getAllVisibleModels();
