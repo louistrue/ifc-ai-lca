@@ -184,7 +184,6 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
   checkLLMStatus: async () => {
     const available = await checkLLMAvailability();
     set({ llmAvailable: available });
-    console.log(`[LCA] LLM availability: ${available}`);
   },
 
   // EPD Proposal Actions
@@ -241,8 +240,6 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
         byCategory,
       },
     });
-
-    console.log(`[LCA] Accepted proposal ${proposalId}, new total GWP: ${totalGWP.toFixed(0)} kg CO₂e`);
   },
 
   rejectProposal: (proposalId) => {
@@ -286,13 +283,6 @@ export function extractMaterialsFromIFC(
   geometryMeshes?: { expressId: number; ifcType?: string; volume?: number }[]
 ): ExtractedMaterial[] {
   if (!ifcDataStore) return [];
-
-  console.log('[LCA] Extracting materials from IFC data store');
-  console.log('[LCA] Data store keys:', Object.keys(ifcDataStore));
-  console.log('[LCA] Has quantities:', !!ifcDataStore.quantities);
-  console.log('[LCA] Quantities type:', ifcDataStore.quantities?.constructor?.name);
-  console.log('[LCA] Has getForEntity:', typeof ifcDataStore.quantities?.getForEntity);
-  console.log('[LCA] Geometry meshes count:', geometryMeshes?.length);
 
   const materialMap = new Map<string, ExtractedMaterial>();
 
@@ -366,8 +356,6 @@ export function extractMaterialsFromIFC(
 
   // If no materials found from properties, try to infer from IFC types
   if (materialMap.size === 0 && geometryMeshes) {
-    console.log('[LCA] No materials found from properties, inferring from IFC types');
-
     // Group by IFC type as fallback
     const typeGroups = new Map<string, number[]>();
 
@@ -377,8 +365,6 @@ export function extractMaterialsFromIFC(
       existing.push(mesh.expressId);
       typeGroups.set(ifcType, existing);
     }
-
-    console.log('[LCA] Found IFC types:', Array.from(typeGroups.keys()));
 
     // Create pseudo-materials from types
     for (const [ifcType, ids] of typeGroups) {
@@ -423,9 +409,6 @@ export function extractMaterialsFromIFC(
         const normalizedType = ifcType.toUpperCase();
         const volumePerElement = typicalVolumes[normalizedType] || 0.5;
         totalVolume = ids.length * volumePerElement;
-        console.log(`[LCA] Estimated ${ifcType}: ${ids.length} elements × ${volumePerElement} m³ = ${totalVolume.toFixed(1)} m³`);
-      } else {
-        console.log(`[LCA] Found quantities for ${ifcType}: ${totalVolume.toFixed(2)} m³, ${totalArea.toFixed(2)} m²`);
       }
 
       const material: ExtractedMaterial = {
@@ -442,7 +425,6 @@ export function extractMaterialsFromIFC(
     }
   }
 
-  console.log('[LCA] Extracted materials:', materialMap.size);
   return Array.from(materialMap.values());
 }
 

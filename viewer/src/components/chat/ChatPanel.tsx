@@ -315,7 +315,8 @@ export function ChatPanel() {
 
       if (!response.ok) {
         const data = await response.json();
-        throw new Error(data.error || 'Request failed');
+        const errorMsg = data.hint ? `${data.error}: ${data.hint}` : data.error || 'Request failed';
+        throw new Error(errorMsg);
       }
 
       const data = await response.json();

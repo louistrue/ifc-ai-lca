@@ -1277,10 +1277,13 @@ export default async function handler(req: Request) {
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return new Response(JSON.stringify({ error: 'API key not configured' }), {
+  if (!apiKey || apiKey.trim() === '') {
+    return new Response(JSON.stringify({
+      error: 'OpenAI API key not configured',
+      details: 'Please add OPENAI_API_KEY to your Vercel environment variables at: Project Settings → Environment Variables'
+    }), {
       status: 401,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });
   }
 
@@ -1338,10 +1341,17 @@ export default async function handler(req: Request) {
       });
 
       if (!response.ok) {
-        const error = await response.text();
-        return new Response(JSON.stringify({ error: 'OpenAI API error', details: error }), {
+        const errorText = await response.text();
+        return new Response(JSON.stringify({
+          error: 'OpenAI API error',
+          details: errorText,
+          status: response.status,
+          hint: response.status === 401 ? 'Check your OPENAI_API_KEY is valid' :
+                response.status === 429 ? 'Rate limited - try again later' :
+                'OpenAI service issue'
+        }), {
           status: 500,
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
         });
       }
 
@@ -1408,10 +1418,16 @@ export default async function handler(req: Request) {
       },
     });
   } catch (error) {
-    console.error('[Agent] Error:', error);
-    return new Response(JSON.stringify({ error: 'Internal server error', details: String(error) }), {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return new Response(JSON.stringify({
+      error: 'Agent error',
+      details: errorMessage,
+      hint: errorMessage.includes('JSON') ? 'Request body parsing failed' :
+            errorMessage.includes('fetch') ? 'Network error calling OpenAI' :
+            'Internal processing error'
+    }), {
       status: 500,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });
   }
 }
