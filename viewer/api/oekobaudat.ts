@@ -230,8 +230,6 @@ export default async function handler(req: Request) {
       url.searchParams.set('name', search);
     }
 
-    console.log(`[Ökobaudat] Fetching: ${url.toString()}`);
-
     const response = await fetch(url.toString(), {
       headers: {
         'Accept': 'application/json',
@@ -258,7 +256,6 @@ export default async function handler(req: Request) {
     const processes = data.data || data.processes || data.dataSet || (Array.isArray(data) ? data : []);
 
     if (!processes || processes.length === 0) {
-      console.log('[Ökobaudat] No processes found');
       return new Response(
         JSON.stringify({ epds: [], totalCount: 0, cached: false }),
         { headers: { 'Content-Type': 'application/json' } }
@@ -267,7 +264,6 @@ export default async function handler(req: Request) {
 
     // Transform to EPD format
     const epds = transformOekobaudatResponse(processes);
-    console.log(`[Ökobaudat] Transformed ${epds.length} EPDs`);
 
     return new Response(
       JSON.stringify({

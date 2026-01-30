@@ -39,12 +39,10 @@ export async function checkOekobaudatAvailability(): Promise<boolean> {
     const epds = await fetchFromOekobaudat({ pageSize: 1 });
     oekobaudatAvailable = epds.length > 0;
     lastApiCheck = Date.now();
-    console.log(`[EPD Database] Ökobaudat API ${oekobaudatAvailable ? 'available' : 'unavailable'}`);
     return oekobaudatAvailable;
   } catch {
     oekobaudatAvailable = false;
     lastApiCheck = Date.now();
-    console.log('[EPD Database] Ökobaudat API unavailable, using fallback');
     return false;
   }
 }
@@ -127,7 +125,6 @@ export async function loadOekobaudatEPDs(): Promise<EPD[]> {
       }
     }
 
-    console.log(`[EPD Database] Loaded ${allEPDs.length} EPDs from Ökobaudat`);
     cachedOekobaudatEPDs = allEPDs;
     return allEPDs;
   } catch (err) {

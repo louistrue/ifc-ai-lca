@@ -18,7 +18,7 @@ import { Button } from '../ui/button';
 import { Send, Bot, User, Loader2, AlertCircle, Copy, Check, Wand2, Leaf, Search, BarChart3 } from 'lucide-react';
 import { EPDProposalsList } from './EPDProposalCard';
 import type { EPDProposal } from '../../store/slices/lcaSlice';
-import { buildModelSummary, estimatePayloadSize, type ModelSummary } from '../../lib/model-context';
+import { buildModelSummary, type ModelSummary } from '../../lib/model-context';
 import { getEPDDatabase } from '../../lib/epd/database';
 
 /** EPD Agent API endpoint */
@@ -243,14 +243,6 @@ export function ChatPanel() {
     // Check for legacy single-file state (ifcDataStore populated but no models in Map)
     const hasLegacyModel = !!(ifcDataStore && geometryResult);
 
-    console.log('[ChatPanel] Checking modelContext:', {
-      hasLcaResults: !!lcaResults,
-      extractedMaterialsCount: extractedMaterials.length,
-      modelsCount: models.size,
-      visibleModelsCount: visibleModels.length,
-      hasLegacyModel,
-    });
-
     if (!lcaResults || extractedMaterials.length === 0) return null;
 
     // For federated models, check if there are visible models
@@ -272,17 +264,6 @@ export function ChatPanel() {
     }] as any[];
 
     const summary = buildModelSummary(modelsForSummary, extractedMaterials, lcaResults);
-
-    // Log payload size for debugging
-    const payloadSize = estimatePayloadSize(summary);
-    console.log(`[EPD Agent] Model context: ${summary.materials.length} materials, ${summary.project.elementCount.toLocaleString()} elements`);
-    console.log(`[EPD Agent] Payload size: ${payloadSize.summaryKB}KB (no element details - on-demand via tools)`);
-
-    // Log materials with spatial data for debugging
-    const materialsWithSpatial = summary.materials.filter(m => m.spatialBreakdown);
-    if (materialsWithSpatial.length > 0) {
-      console.log(`[EPD Agent] ${materialsWithSpatial.length} materials have spatial breakdown data`);
-    }
 
     return { summary };
   }, [lcaResults, extractedMaterials, getAllVisibleModels, models, ifcDataStore, geometryResult]); // Added models + legacy state for reactivity

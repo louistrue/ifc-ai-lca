@@ -385,7 +385,6 @@ export async function fetchFromOekobaudat(params: OekobaudatSearchParams = {}): 
   const cacheKey = getCacheKey(params);
   const cached = cache.get(cacheKey);
   if (cached && isCacheValid(cached)) {
-    console.log('[Ökobaudat] Returning cached data');
     return cached.data;
   }
 
@@ -395,8 +394,6 @@ export async function fetchFromOekobaudat(params: OekobaudatSearchParams = {}): 
     : '/api/oekobaudat';
 
   try {
-    console.log('[Ökobaudat] Fetching from API...', params);
-
     const response = await fetch(apiEndpoint, {
       method: 'POST',
       headers: {
@@ -410,7 +407,6 @@ export async function fetchFromOekobaudat(params: OekobaudatSearchParams = {}): 
     }
 
     const data = await response.json() as { epds: EPD[]; totalCount: number };
-    console.log(`[Ökobaudat] Received ${data.epds.length} EPDs`);
 
     // Cache results
     cache.set(cacheKey, {
@@ -474,7 +470,6 @@ export async function getOekobaudatByCategory(category: MaterialCategory): Promi
  */
 export function clearOekobaudatCache(): void {
   cache.clear();
-  console.log('[Ökobaudat] Cache cleared');
 }
 
 /**

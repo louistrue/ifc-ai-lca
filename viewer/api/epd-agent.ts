@@ -1288,9 +1288,6 @@ export default async function handler(req: Request) {
     const body: AgentRequest = await req.json();
     const { message, modelContext, elementDetails, epdDatabase, conversationHistory = [] } = body;
 
-    // Log EPD database info
-    console.log(`[Agent] Received ${epdDatabase?.length || 0} EPDs from frontend`);
-
     // Build context summary for system prompt
     let contextSummary = '\n\n--- CURRENT MODEL ---\n';
     contextSummary += `Project: ${modelContext.project.name}\n`;
@@ -1368,8 +1365,6 @@ export default async function handler(req: Request) {
         for (const toolCall of assistantMessage.tool_calls) {
           const toolName = toolCall.function.name;
           const toolArgs = JSON.parse(toolCall.function.arguments);
-
-          console.log(`[Agent] Tool: ${toolName}`, toolArgs);
 
           const { result, proposal } = executeToolCall(toolName, toolArgs, modelContext, elementDetails, epdDatabase);
 

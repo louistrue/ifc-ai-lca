@@ -228,13 +228,7 @@ export function LCAPanel() {
   // Run fuzzy/algorithmic EPD matching when materials are extracted (instant results)
   // LLM refinement is available through the chat panel's EPD Agent mode
   useEffect(() => {
-    console.log('[LCAPanel] Matching effect check:', {
-      materialsCount: extractedMaterials.length,
-      hasLcaResults: !!lcaResults,
-      isMatchingInProgress,
-    });
     if (extractedMaterials.length > 0 && !lcaResults && !isMatchingInProgress) {
-      console.log('[LCAPanel] Triggering runEPDMatching...');
       runEPDMatching();
     }
   }, [extractedMaterials, lcaResults, isMatchingInProgress, runEPDMatching]);

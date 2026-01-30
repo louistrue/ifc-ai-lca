@@ -99,7 +99,6 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
 
   // Actions
   setExtractedMaterials: (materials) => {
-    console.log('[LCA] setExtractedMaterials called:', materials.length, 'materials');
     set({ extractedMaterials: materials });
   },
 
@@ -110,11 +109,8 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
     set({ isLoadingEPDs: true, epdDataSource: 'loading' });
 
     try {
-      console.log('[LCA] Loading EPDs from Ökobaudat...');
       const epds = await loadOekobaudatEPDs();
       const info = getEPDDataSourceInfo();
-
-      console.log(`[LCA] EPD data loaded: ${info.count} EPDs from ${info.source}`);
 
       set({
         isLoadingEPDs: false,
@@ -134,20 +130,10 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
 
   runEPDMatching: () => {
     const { extractedMaterials } = get();
-    console.log('[LCA] runEPDMatching called, materials count:', extractedMaterials.length);
-    if (extractedMaterials.length === 0) {
-      console.log('[LCA] No materials to match, returning early');
-      return;
-    }
+    if (extractedMaterials.length === 0) return;
 
     set({ isMatchingInProgress: true });
-    console.log('[LCA] Running algorithmic EPD matching...');
     const results = matchAllMaterials(extractedMaterials);
-    console.log('[LCA] EPD matching complete:', {
-      matchCount: results.matches.length,
-      totalGWP: results.totalGWP,
-      unmatchedCount: results.unmatchedMaterials.length,
-    });
     set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: 'algorithmic' });
   },
 
@@ -160,14 +146,12 @@ export const createLCASlice: StateCreator<LCASlice, [], [], LCASlice> = (set, ge
     set({ isMatchingInProgress: true, matchingMethod: 'none' });
 
     try {
-      console.log('[LCA] Running LLM-based EPD matching...');
       const results = await matchAllMaterialsWithLLM(extractedMaterials, true);
 
       // Determine which method was actually used
       const usedLLM = results.matches.some(m => m.matchReason.startsWith('LLM:'));
       const method = usedLLM ? 'llm' : 'algorithmic';
 
-      console.log(`[LCA] Matching complete using ${method} method`);
       set({ lcaResults: results, isMatchingInProgress: false, matchingMethod: method });
     } catch (error) {
       console.error('[LCA] LLM matching failed:', error);
